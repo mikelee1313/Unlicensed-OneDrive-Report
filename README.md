@@ -1,2 +1,319 @@
-# Unlicensed-OneDrive-Report
-Identifies all unlicensed OneDrive accounts across the tenant (all geo locations) using Microsoft Graph API only — no SPO PowerShell module, no per-geo tokens, and no manual admin center navigation required.
+# Get-UnlicensedOneDriveReport.ps1
+
+A PowerShell script that identifies all unlicensed OneDrive accounts across a Microsoft 365 tenant using the **Microsoft Graph API only** — no SharePoint Online PowerShell module, no per-geo tokens, and no manual admin center navigation required.
+
+---
+
+## Overview
+
+When a Microsoft 365 user loses their OneDrive/SharePoint license (license removed, user deleted, or license plan disabled), Microsoft begins a countdown toward archival and eventual deletion of their OneDrive:
+
+| Day | Action |
+|-----|--------|
+| Day 0 | License removed / user deleted |
+| Day 60 | OneDrive goes **read-only** |
+| Day 93 | OneDrive is **archived** (or deleted if billing is not enabled) |
+
+> Microsoft began enforcing this policy on **January 27, 2025**.  
+> Reference: [Unlicensed OneDrive accounts](https://learn.microsoft.com/en-us/sharepoint/unlicensed-onedrive-accounts)
+
+This script scans the entire tenant, identifies both populations of unlicensed OneDrive accounts, calculates exactly where each account is in the Day 60 / Day 93 timeline, and exports a prioritized CSV report.
+
+---
+
+## Features
+
+- ✅ **No SPO PowerShell module required** — pure Microsoft Graph API
+- ✅ **Multi-geo aware** — a single Graph token covers NAM, APC, CAN, DEU, GBR, IND, JPN automatically
+- ✅ **Certificate or Client Secret authentication** — supports both auth flows
+- ✅ **Detects both unlicensed populations** — active users with no license + soft-deleted users
+- ✅ **Audit log enrichment** — queries `directoryAudits` to find the exact date each license was removed (optional, requires `AuditLog.Read.All`)
+- ✅ **Throttle handling** — exponential backoff with Retry-After support (429, 502, 503, 504)
+- ✅ **Traffic-light urgency labels** — `CRITICAL`, `WARNING`, `MONITOR`, `OK`, `ARCHIVED`
+- ✅ **UTF-8 BOM CSV output** — Excel-safe encoding
+
+---
+
+## Prerequisites
+
+### PowerShell
+- PowerShell 5.1 or later (Windows)
+
+### Azure App Registration
+A single app registration in the **home tenant** is required. The app must be granted the following **Application** permissions (not Delegated) with admin consent:
+
+| Permission | Required | Purpose |
+|---|---|---|
+| `User.Read.All` | ✅ Required | Enumerate all users and read `assignedPlans` to detect unlicensed accounts |
+| `Directory.Read.All` | ✅ Required | Read soft-deleted users from the Entra ID 30-day recycle bin |
+| `Files.Read.All` | ✅ Required | Read OneDrive drive metadata for any user across all geo locations |
+| `AuditLog.Read.All` | ⚠️ Optional | Query `directoryAudits` to find the exact license removal date. Set `$includeLicenseRemovalDates = $false` to skip. |
+
+### Authentication
+The script supports two authentication methods. Configure one in the `#region Configuration` block:
+
+**Option A — Certificate (recommended)**
+1. Generate a self-signed certificate or use an existing one
+2. Upload the certificate public key to the app registration
+3. Install the certificate (with private key) on the machine running the script
+4. Set `$AuthType = 'Certificate'`, `$Thumbprint`, and `$CertStore`
+
+**Option B — Client Secret**
+1. Create a client secret in the app registration
+2. Set `$AuthType = 'ClientSecret'` and `$clientSecret`
+
+> ⚠️ Never commit a client secret to source control. Use environment variables or a secrets manager in production.
+
+---
+
+## Configuration
+
+All configuration is in the `#region Configuration` block at the top of the script. Edit these values before running:
+
+```powershell
+# Tenant and App Registration
+$tenantId  = 'your-tenant-id'
+$clientId  = 'your-app-client-id'
+
+# Auth: 'Certificate' or 'ClientSecret'
+$AuthType  = 'Certificate'
+$Thumbprint = 'YOUR_CERT_THUMBPRINT'
+$CertStore  = 'LocalMachine'   # or 'CurrentUser'
+$clientSecret = ''             # only used when $AuthType = 'ClientSecret'
+
+# Output folder for the CSV report
+$OutputFolder = $env:TEMP
+
+# Microsoft's documented thresholds (do not change unless Microsoft updates them)
+$ReadOnlyThresholdDays = 60
+$ArchiveThresholdDays  = 93
+
+# Audit log settings
+$includeLicenseRemovalDates = $true   # Set $false to skip Phase 3 (faster)
+$AuditLogLookbackDays       = 180     # Max supported lookback
+
+# Throttle settings
+$MaxRetries          = 15
+$InitialBackoffSec   = 3
+$RequestTimeoutSec   = 300
+
+# Optional delay between OneDrive drive queries (seconds). 0 = no delay.
+$delayBetweenRequests = 0
+```
+
+---
+
+## Script Flow
+
+The script executes in **5 phases** plus initialization and output steps:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  AUTHENTICATION                                                  │
+│  AcquireToken — Certificate JWT or Client Secret flow           │
+│  Single Graph token covers all geo datacenters                  │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 1 — Active Unlicensed Users                              │
+│  GET /users?$select=id,userPrincipalName,...,assignedPlans      │
+│  Pages through ALL active Entra ID users ($top=999 per page)    │
+│  Checks each user's assignedPlans for an enabled OneDrive or    │
+│  SharePoint service plan ID                                     │
+│  → Collects users with NO enabled plan into $activeUnlicensed   │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 2 — Soft-Deleted Users                                   │
+│  GET /directory/deletedItems/microsoft.graph.user               │
+│  Returns users in the Entra ID 30-day recycle bin               │
+│  Uses deletedDateTime as the UnlicensedDate                     │
+│  → Collects into $softDeletedUsers                              │
+│  NOTE: Users deleted >30 days ago are purged — not discoverable │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  MERGE — De-duplicate                                           │
+│  Combines Phase 1 + Phase 2 populations                         │
+│  Removes any user appearing in both sets (dedup on UserId)      │
+│  → $allCandidates                                               │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 3 — Audit Log Enrichment (optional)                      │
+│  GET /auditLogs/directoryAudits                                 │
+│  Queries two activity types in sequence:                        │
+│    1. "Change user license"                                     │
+│    2. "Remove user from licensed group"                         │
+│  Filtered by $AuditLogLookbackDays in PowerShell after fetch    │
+│  (API-side activityDateTime filter causes 400 in some tenants)  │
+│  Builds userId → most-recent-event-date lookup table            │
+│  → Populates UnlicensedDate on $activeUnlicensed entries        │
+│  Skipped if $includeLicenseRemovalDates = $false                │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 4 — OneDrive Drive Query                                 │
+│  GET /users/{id}/drive  (one call per candidate)                │
+│  Graph routes each call to the correct geo automatically        │
+│  404 = no OneDrive exists → skipped from report                │
+│  403 / timeout = access error → included in report for review  │
+│  → $confirmedUnlicensed (only users with an active drive)       │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 5 — Milestone Calculations                               │
+│  For each confirmed account with a known UnlicensedDate:        │
+│    ReadOnlyDate        = UnlicensedDate + 60 days               │
+│    ArchiveDate         = UnlicensedDate + 93 days               │
+│    DaysSinceUnlicensed = Today - UnlicensedDate                 │
+│    DaysUntilReadOnly   = ReadOnlyDate - Today                   │
+│    DaysUntilArchive    = ArchiveDate - Today                    │
+│  Assigns UrgencyStatus traffic-light label (see below)          │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  OUTPUT                                                         │
+│  Sorts report: CRITICAL → ARCHIVED → WARNING → MONITOR → OK    │
+│  Exports UTF-8 BOM CSV to $OutputFolder                         │
+│  Prints summary to console (by source and by urgency)           │
+│  File: UnlicensedOneDrive_<yyyyMMddHHmmss>.csv                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Urgency Status Labels
+
+| Label | Condition |
+|---|---|
+| `CRITICAL - Archives TODAY` | ArchiveDate = today |
+| `CRITICAL - Archives within 7 days` | DaysUntilArchive ≤ 7 |
+| `ARCHIVED - Past Day 93` | DaysUntilArchive < 0 |
+| `WARNING - Goes Read-Only TODAY` | DaysUntilReadOnly = today |
+| `WARNING - Read-Only within 7 days` | DaysUntilReadOnly ≤ 7 |
+| `WARNING - Read-Only, Archive pending` | Past Day 60, archive > 7 days away |
+| `MONITOR - Read-Only within 30 days` | DaysUntilReadOnly ≤ 30 |
+| `OK - More than 30 days remaining` | DaysUntilReadOnly > 30 |
+| `Unknown - No Unlicensed Date` | No audit event found within lookback window |
+
+---
+
+## Usage
+
+```powershell
+# Edit the configuration section, then run:
+.\Get-UnlicensedOneDriveReport.ps1
+```
+
+The script is entirely self-contained — no parameters, no module imports. All settings are in the configuration block at the top.
+
+---
+
+## Output — CSV Columns
+
+| Column | Description |
+|---|---|
+| `UserSource` | `Active` (licensed removed) or `SoftDeleted` (user deleted from Entra) |
+| `DisplayName` | User's display name |
+| `UserPrincipalName` | UPN |
+| `AccountEnabled` | Whether the Entra account is still enabled |
+| `UnlicensedDueTo` | `License removed by admin` or `Owner deleted from Entra ID` |
+| `UnlicensedDate` | Date/time the license was removed (from audit log or deletedDateTime) |
+| `DaysSinceUnlicensed` | Days elapsed since UnlicensedDate |
+| `ReadOnlyDate` | Date OneDrive goes read-only (Day 60) |
+| `ArchiveDate` | Date OneDrive is archived/deleted (Day 93) |
+| `DaysUntilReadOnly` | Days remaining until read-only (negative = already read-only) |
+| `DaysUntilArchive` | Days remaining until archived (negative = already archived) |
+| `UrgencyStatus` | Traffic-light label (see table above) |
+| `StorageUsedGB` | OneDrive storage used (GB) |
+| `StorageTotalGB` | OneDrive storage quota (GB) |
+| `DriveUrl` | Direct URL to the OneDrive |
+| `DriveLastModified` | Last modification timestamp of the drive |
+| `DriveType` | Drive type (e.g., `business`) |
+| `Notes` | Error details for 403/timeout entries |
+
+---
+
+## Detected Service Plans
+
+The script detects a user as unlicensed when **none** of the following service plan IDs appear in their `assignedPlans` with `capabilityStatus = 'Enabled'`:
+
+### OneDrive Plans
+| Plan Name | ID |
+|---|---|
+| ONEDRIVELITE_IW (Office for the web with OneDrive, Basic Collaboration) | `b4ac11a0` |
+| ONEDRIVECLIPCHAMP (OneDrive with Clipchamp Premium) | `f7e5b77d` |
+| ONEDRIVESTANDARD (OneDrive Plan 1 — M365 Apps, E1) | `13696edf` |
+| ONEDRIVE_BASIC variant | `4495894f` |
+| ONEDRIVEENTERPRISE (OneDrive Plan 2 — standalone) | `afcafa6a` |
+| ONEDRIVE_BASIC (Visio plans) | `da792a53` |
+| ONEDRIVE_BASIC_GOV (Government) | `98709c2e` |
+
+### SharePoint Plans
+| Plan Name | ID |
+|---|---|
+| SHAREPOINTWAC (Office for the web — E1/E3/E5) | `e95bec33` |
+| SHAREPOINTENTERPRISE (SharePoint Plan 2 — E3/E5) | `5dbe027f` |
+| SHAREPOINTDESKLESS (F-tier/Teams Free) | `902b47e5` |
+| SHAREPOINTENTERPRISE_EDU (Education) | `63038b2c` |
+| SHAREPOINTENTERPRISE_MIDMARKET | `6b5b6a67` |
+| SHAREPOINTSTANDARD (SharePoint Plan 1 — standalone) | `c7699d2e` |
+| SHAREPOINTSTANDARD_EDU (Education) | `0a4983bb` |
+
+This covers **O365/M365 E1, E3, E5**, Business Basic/Standard/Premium, F1/F3, and Education SKUs.
+
+---
+
+## Limitations
+
+| Limitation | Detail |
+|---|---|
+| Users deleted > 30 days ago | Permanently purged from Entra ID — not discoverable via Graph. Use the SharePoint admin center report for those accounts. |
+| Audit log lookback | `directoryAudits` retains data for a maximum of **180 days**. License changes older than `$AuditLogLookbackDays` will show `Unknown - No Unlicensed Date`. |
+| Audit log API date filter | The `activityDateTime ge` OData filter causes HTTP 400 in some tenants. The script works around this by fetching all events for each activity type and filtering by date in PowerShell. |
+| Guest / external users | Guest accounts without a OneDrive license are included in the scan but typically return 404 on the drive query and are filtered out. |
+
+---
+
+## Throttling & Performance
+
+The script includes a full throttle-handling wrapper (`Invoke-GraphRequestWithThrottleHandling`) that:
+
+- Respects `Retry-After` headers on 429 responses
+- Applies exponential backoff for 502/503/504 and network timeouts
+- Retries up to `$MaxRetries` (default: 15) times per request
+- Caps backoff at 300 seconds
+
+For large tenants (10,000+ users), Phase 4 (drive queries) is the most time-consuming step as it makes one Graph call per candidate. Set `$delayBetweenRequests = 0` for maximum speed, or increase it if you need to reduce API load.
+
+---
+
+## Security Notes
+
+- **Certificate authentication is recommended** over client secrets for production use
+- The script uses `GetRSAPrivateKey()` (supports both CAPI and CNG/KSP certificate providers) rather than the legacy `.PrivateKey` property
+- Do not store client secrets in the script file — use environment variables or a secrets manager
+- The app registration requires only **read** permissions — no write access to any resource
+
+---
+
+## References
+
+- [Unlicensed OneDrive accounts — Microsoft docs](https://learn.microsoft.com/en-us/sharepoint/unlicensed-onedrive-accounts)
+- [Graph API: List users](https://learn.microsoft.com/en-us/graph/api/user-list)
+- [Graph API: Get drive](https://learn.microsoft.com/en-us/graph/api/drive-get)
+- [Graph API: List directoryAudits](https://learn.microsoft.com/en-us/graph/api/directoryaudit-list)
+- [Service plan identifiers for licensing](https://learn.microsoft.com/en-us/entra/identity/users/licensing-service-plan-reference)
+
+---
+
+## Author
+
+**Mike Lee**  
+Created: April 28, 2026
