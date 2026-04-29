@@ -17,7 +17,7 @@ When a Microsoft 365 user loses their OneDrive/SharePoint license (license remov
 > Microsoft began enforcing this policy on **January 27, 2025**.  
 > Reference: [Unlicensed OneDrive accounts](https://learn.microsoft.com/en-us/sharepoint/unlicensed-onedrive-accounts)
 
-This script scans the entire tenant, identifies both populations of unlicensed OneDrive accounts, calculates exactly where each account is in the Day 60 / Day 93 timeline, and exports a prioritized CSV report.
+This script scans the entire tenant, identifies **three populations** of unlicensed OneDrive accounts, calculates exactly where each account is in the Day 60 / Day 93 timeline, and exports a prioritized CSV report.
 
 ---
 
@@ -26,7 +26,8 @@ This script scans the entire tenant, identifies both populations of unlicensed O
 - ✅ **No SPO PowerShell module required** — pure Microsoft Graph API
 - ✅ **Multi-geo aware** — a single Graph token covers NAM, APC, CAN, DEU, GBR, IND, JPN automatically
 - ✅ **Certificate or Client Secret authentication** — supports both auth flows
-- ✅ **Detects both unlicensed populations** — active users with no license + soft-deleted users
+- ✅ **Detects all three unlicensed populations** — active users with no license + soft-deleted users + already-archived OneDrive sites
+- ✅ **Finds sites Microsoft has already archived** — enumerates `GET /sites/getAllSites` and detects archived personal OneDrives via HTTP 423 response (optional, requires `Sites.Read.All`)
 - ✅ **Audit log enrichment** — queries `directoryAudits` to find the exact date each license was removed (optional, requires `AuditLog.Read.All`)
 - ✅ **Throttle handling** — exponential backoff with Retry-After support (429, 502, 503, 504)
 - ✅ **Traffic-light urgency labels** — `CRITICAL`, `WARNING`, `MONITOR`, `OK`, `ARCHIVED`
@@ -48,6 +49,7 @@ A single app registration in the **home tenant** is required. The app must be gr
 | `Directory.Read.All` | ✅ Required | Read soft-deleted users from the Entra ID 30-day recycle bin |
 | `Files.Read.All` | ✅ Required | Read OneDrive drive metadata for any user across all geo locations |
 | `AuditLog.Read.All` | ⚠️ Optional | Query `directoryAudits` to find the exact license removal date. Set `$includeLicenseRemovalDates = $false` to skip. |
+| `Sites.Read.All` | ⚠️ Optional | Enumerate all SharePoint sites via `GET /sites/getAllSites` to find personal OneDrive sites already archived by Microsoft. Set `$GetCurrentlyArchived = $false` to skip. |
 
 ### Authentication
 The script supports two authentication methods. Configure one in the `#region Configuration` block:
@@ -92,6 +94,9 @@ $ArchiveThresholdDays  = 93
 $includeLicenseRemovalDates = $true   # Set $false to skip Phase 3 (faster)
 $AuditLogLookbackDays       = 180     # Max supported lookback
 
+# Archived OneDrive sites (Sites API)
+$GetCurrentlyArchived = $true         # Set $false to skip Phase 2b (no Sites.Read.All needed)
+
 # Throttle settings
 $MaxRetries          = 15
 $InitialBackoffSec   = 3
@@ -105,7 +110,7 @@ $delayBetweenRequests = 0
 
 ## Script Flow
 
-The script executes in **5 phases** plus initialization and output steps:
+The script executes in **5 phases** (plus Phase 2b) plus initialization and output steps:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -132,6 +137,7 @@ The script executes in **5 phases** plus initialization and output steps:
 │  Uses deletedDateTime as the UnlicensedDate                     │
 │  → Collects into $softDeletedUsers                              │
 │  NOTE: Users deleted >30 days ago are purged — not discoverable │
+│        by Phases 1 or 2; use Phase 2b instead                   │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
@@ -140,6 +146,26 @@ The script executes in **5 phases** plus initialization and output steps:
 │  Combines Phase 1 + Phase 2 populations                         │
 │  Removes any user appearing in both sets (dedup on UserId)      │
 │  → $allCandidates                                               │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PHASE 2b — Already-Archived OneDrive Sites (optional)          │
+│  Requires: $GetCurrentlyArchived = $true + Sites.Read.All       │
+│                                                                 │
+│  Step A: GET /sites/getAllSites — enumerate all tenant sites     │
+│          Filter: isPersonalSite = true                          │
+│          → $personalSites list                                  │
+│                                                                 │
+│  Step B: For each personal site:                                │
+│          GET /beta/sites/{id}?$select=id,siteCollection         │
+│          HTTP 423 Locked = site is archived by Microsoft        │
+│          (Graph refuses metadata requests for archived sites)   │
+│          200 OK with null archivalDetails = active site, skip  │
+│                                                                 │
+│  Deduplicates against Phase 1/2 results by UPN                 │
+│  → $archivedSites (UserSource = 'Archived')                     │
+│  Skipped if $GetCurrentlyArchived = $false                      │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
@@ -159,22 +185,26 @@ The script executes in **5 phases** plus initialization and output steps:
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  PHASE 4 — OneDrive Drive Query                                 │
-│  GET /users/{id}/drive  (one call per candidate)                │
+│  GET /users/{id}/drive  (one call per Phase 1/2 candidate)      │
 │  Graph routes each call to the correct geo automatically        │
 │  404 = no OneDrive exists → skipped from report                │
 │  403 / timeout = access error → included in report for review  │
-│  → $confirmedUnlicensed (only users with an active drive)       │
+│  → $confirmedUnlicensed                                         │
+│  Phase 2b sites are merged in AFTER Phase 4 (drive already     │
+│  queried inside Get-ArchivedOneDriveSites — 423 = no data)      │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  PHASE 5 — Milestone Calculations                               │
-│  For each confirmed account with a known UnlicensedDate:        │
+│  For Phase 1/2 accounts with a known UnlicensedDate:            │
 │    ReadOnlyDate        = UnlicensedDate + 60 days               │
 │    ArchiveDate         = UnlicensedDate + 93 days               │
 │    DaysSinceUnlicensed = Today - UnlicensedDate                 │
 │    DaysUntilReadOnly   = ReadOnlyDate - Today                   │
 │    DaysUntilArchive    = ArchiveDate - Today                    │
+│  For Phase 2b accounts (no UnlicensedDate available):           │
+│    UrgencyStatus = ARCHIVED - Currently Archived                │
 │  Assigns UrgencyStatus traffic-light label (see below)          │
 └────────────────────────┬────────────────────────────────────────┘
                          │
@@ -190,17 +220,18 @@ The script executes in **5 phases** plus initialization and output steps:
 
 ### Urgency Status Labels
 
-| Label | Condition |
-|---|---|
-| `CRITICAL - Archives TODAY` | ArchiveDate = today |
-| `CRITICAL - Archives within 7 days` | DaysUntilArchive ≤ 7 |
-| `ARCHIVED - Past Day 93` | DaysUntilArchive < 0 |
-| `WARNING - Goes Read-Only TODAY` | DaysUntilReadOnly = today |
-| `WARNING - Read-Only within 7 days` | DaysUntilReadOnly ≤ 7 |
-| `WARNING - Read-Only, Archive pending` | Past Day 60, archive > 7 days away |
-| `MONITOR - Read-Only within 30 days` | DaysUntilReadOnly ≤ 30 |
-| `OK - More than 30 days remaining` | DaysUntilReadOnly > 30 |
-| `Unknown - No Unlicensed Date` | No audit event found within lookback window |
+| Label | Source | Condition |
+|---|---|---|
+| `CRITICAL - Archives TODAY` | Phase 1/2 | ArchiveDate = today |
+| `CRITICAL - Archives within 7 days` | Phase 1/2 | DaysUntilArchive ≤ 7 |
+| `ARCHIVED - Past Day 93` | Phase 1/2 | DaysUntilArchive < 0 (date known) |
+| `ARCHIVED - Currently Archived` | Phase 2b | Site returned HTTP 423 Locked |
+| `WARNING - Goes Read-Only TODAY` | Phase 1/2 | DaysUntilReadOnly = today |
+| `WARNING - Read-Only within 7 days` | Phase 1/2 | DaysUntilReadOnly ≤ 7 |
+| `WARNING - Read-Only, Archive pending` | Phase 1/2 | Past Day 60, archive > 7 days away |
+| `MONITOR - Read-Only within 30 days` | Phase 1/2 | DaysUntilReadOnly ≤ 30 |
+| `OK - More than 30 days remaining` | Phase 1/2 | DaysUntilReadOnly > 30 |
+| `Unknown - No Unlicensed Date` | Phase 1 | No audit event found within lookback window |
 
 ---
 
@@ -219,11 +250,11 @@ The script is entirely self-contained — no parameters, no module imports. All 
 
 | Column | Description |
 |---|---|
-| `UserSource` | `Active` (licensed removed) or `SoftDeleted` (user deleted from Entra) |
+| `UserSource` | `Active` (license removed), `SoftDeleted` (deleted from Entra, within 30-day recycle bin), or `Archived` (OneDrive already archived by Microsoft — Entra user purged >30 days ago) |
 | `DisplayName` | User's display name |
 | `UserPrincipalName` | UPN |
 | `AccountEnabled` | Whether the Entra account is still enabled |
-| `UnlicensedDueTo` | `License removed by admin` or `Owner deleted from Entra ID` |
+| `UnlicensedDueTo` | `License removed by admin`, `Owner deleted from Entra ID`, or `OneDrive archived by Microsoft` |
 | `UnlicensedDate` | Date/time the license was removed (from audit log or deletedDateTime) |
 | `DaysSinceUnlicensed` | Days elapsed since UnlicensedDate |
 | `ReadOnlyDate` | Date OneDrive goes read-only (Day 60) |
@@ -236,7 +267,7 @@ The script is entirely self-contained — no parameters, no module imports. All 
 | `DriveUrl` | Direct URL to the OneDrive |
 | `DriveLastModified` | Last modification timestamp of the drive |
 | `DriveType` | Drive type (e.g., `business`) |
-| `Notes` | Error details for 403/timeout entries |
+| `Notes` | For Phase 2b archived sites: `Site is archived (HTTP 423 Locked) — storage details unavailable while archived`. For Phase 1/2 errors: HTTP status and message. |
 
 ---
 
@@ -274,10 +305,12 @@ This covers **O365/M365 E1, E3, E5**, Business Basic/Standard/Premium, F1/F3, an
 
 | Limitation | Detail |
 |---|---|
-| Users deleted > 30 days ago | Permanently purged from Entra ID — not discoverable via Graph. Use the SharePoint admin center report for those accounts. |
+| Users deleted > 30 days ago | Permanently purged from the Entra ID recycle bin — not visible in Phases 1 or 2. However, **Phase 2b** (`$GetCurrentlyArchived = $true`) can still find these accounts as long as Microsoft has archived (not yet deleted) their OneDrive. Graph returns HTTP 423 Locked for archived personal sites, which the script detects. Once Microsoft purges the OneDrive entirely, the site disappears from `getAllSites` and cannot be found by any Graph call. |
 | Audit log lookback | `directoryAudits` retains data for a maximum of **180 days**. License changes older than `$AuditLogLookbackDays` will show `Unknown - No Unlicensed Date`. |
 | Audit log API date filter | The `activityDateTime ge` OData filter causes HTTP 400 in some tenants. The script works around this by fetching all events for each activity type and filtering by date in PowerShell. |
 | Guest / external users | Guest accounts without a OneDrive license are included in the scan but typically return 404 on the drive query and are filtered out. |
+| Phase 2b storage data | Archived sites return HTTP 423 Locked on both the site metadata and drive queries, so `StorageUsedGB` and `StorageTotalGB` are blank for `Archived` source entries. Use the SharePoint admin center for exact storage figures. |
+| Phase 2b UPN reconstruction | UPNs are reconstructed from the personal site URL (e.g. `john_doe_contoso_com` → `john.doe@contoso.com`). Usernames containing `.` or `_` are ambiguous after SharePoint's encoding and the reconstructed UPN may differ from the original. `DisplayName` is always accurate. |
 
 ---
 
@@ -291,6 +324,8 @@ The script includes a full throttle-handling wrapper (`Invoke-GraphRequestWithTh
 - Caps backoff at 300 seconds
 
 For large tenants (10,000+ users), Phase 4 (drive queries) is the most time-consuming step as it makes one Graph call per candidate. Set `$delayBetweenRequests = 0` for maximum speed, or increase it if you need to reduce API load.
+
+Phase 2b makes **two Graph calls per personal OneDrive site** (one individual site detail GET to detect 423). In a tenant with hundreds of personal sites this adds a modest number of extra calls but is bounded by the number of personal OneDrives, not total users.
 
 ---
 
@@ -309,6 +344,8 @@ For large tenants (10,000+ users), Phase 4 (drive queries) is the most time-cons
 - [Graph API: List users](https://learn.microsoft.com/en-us/graph/api/user-list)
 - [Graph API: Get drive](https://learn.microsoft.com/en-us/graph/api/drive-get)
 - [Graph API: List directoryAudits](https://learn.microsoft.com/en-us/graph/api/directoryaudit-list)
+- [Graph API: List all sites (getAllSites)](https://learn.microsoft.com/en-us/graph/api/site-getallsites)
+- [Graph API: siteArchivalDetails resource](https://learn.microsoft.com/en-us/graph/api/resources/sitearchivaldetails)
 - [Service plan identifiers for licensing](https://learn.microsoft.com/en-us/entra/identity/users/licensing-service-plan-reference)
 
 ---
