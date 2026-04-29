@@ -2,6 +2,13 @@
 
 A PowerShell script that identifies all unlicensed OneDrive accounts across a Microsoft 365 tenant using the **Microsoft Graph API only** — no SharePoint Online PowerShell module, no per-geo tokens, and no manual admin center navigation required.
 
+The Get‑UnlicensedOneDriveReport.ps1 script scans the entire Microsoft 365 tenant and identifies all unlicensed OneDrive accounts using Microsoft Graph only—no SharePoint Online PowerShell module, no per‑geo tokens, and no manual admin center checks required. It detects unlicensed OneDrives across active users, soft‑deleted users, and already‑archived OneDrive sites, and calculates where each account falls in Microsoft’s Day 60 (read‑only) and Day 93 (archive/delete) enforcement timeline. The output is a prioritized CSV report with clear urgency labels
+
+- Proactive risk management: Admins can quickly identify OneDrive accounts that are approaching read‑only or archive status, reducing the risk of data loss or surprise support escalations.
+- Cost control: With Microsoft enforcing archiving and billing for unlicensed OneDrives, the report helps admins find accounts that may soon incur archive or storage charges and act before costs are triggered.
+- Tenant‑wide visibility: The script is multi‑geo aware and reports across all regions through a single Graph token, something that’s otherwise difficult to do at scale using built‑in tools. 
+- Automation‑ready: Designed for scheduled or repeat use, it enables SPO admins to incorporate unlicensed OneDrive monitoring into regular governance and offboarding processes
+
 ---
 
 ## Overview
