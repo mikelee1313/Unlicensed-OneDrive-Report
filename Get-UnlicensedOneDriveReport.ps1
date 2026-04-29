@@ -27,7 +27,9 @@
       the owner was deleted from Entra ID more than 30 days ago (purged from the
       recycle bin). The Entra user object no longer exists so Phases 1 and 2 cannot
       find these accounts. They are discovered by enumerating all SharePoint sites.
-      Graph endpoint : GET /sites/getAllSites (filter: isPersonalSite + siteCollection.archivalDetails)
+      Graph endpoint : GET /beta/sites/getAllSites?$filter=isPersonalSite eq true&$select=...siteCollection
+      Strategy       : Pass 1 — bulk beta call; archivalDetails inline = no per-site call needed.
+                       Pass 2 — per-site fallback (beta GET + HTTP 423) for sites with null archivalDetails.
       Unlicensed date: Not available — occurred before the Entra purge (>30 days ago)
       Requires       : Sites.Read.All (Application)
       Toggle via     : $GetCurrentlyArchived = $true / $false
@@ -121,7 +123,7 @@ $AuditLogLookbackDays = 180
 # >30 days ago (purged from recycle bin) and whose OneDrive has since been archived.
 # Requires Sites.Read.All (Application) on the app registration.
 # When $false: only reports on active/soft-deleted populations (no Sites.Read.All needed).
-$GetCurrentlyArchived = $false
+$GetCurrentlyArchived = $true
 
 # ---- Request throttling ----
 $MaxRetries = 15
@@ -687,29 +689,37 @@ function Get-SiteDriveInfo {
 function Get-ArchivedOneDriveSites {
     <#
     .SYNOPSIS
-        Queries GET /sites/getAllSites to find personal OneDrive sites that Microsoft
+        Queries GET /beta/sites/getAllSites to find personal OneDrive sites that Microsoft
         has already archived. These sites belong to users whose Entra account was
         deleted more than 30 days ago and whose OneDrive has entered archival.
 
         Requires Sites.Read.All (Application) on the app registration.
-        archivalInformation is only returned when explicitly included in $select.
+
+        Two-pass strategy to minimise per-site API calls:
+          Pass 1 — Bulk: beta getAllSites with siteCollection in $select.
+                   If archivalDetails.archiveStatus is returned inline, the site is
+                   classified immediately — no per-site call required.
+          Pass 2 — Per-site fallback: only for sites where archivalDetails was null
+                   in the bulk response. Individual GET /beta/sites/{id}?$select=siteCollection
+                   is used; HTTP 423 Locked is also treated as an archived signal.
 
         Sites with archiveStatus 'reactivating' or 'unknownFutureValue' are skipped.
     #>
-    Write-Host "`nPhase 2b: Querying all SharePoint sites for archived personal OneDrives..." -ForegroundColor Cyan
+    Write-Host "`nPhase 2b: Querying personal OneDrive sites for archived accounts..." -ForegroundColor Cyan
     Write-Host "  Requires Sites.Read.All permission on the app registration." -ForegroundColor Gray
-    Write-Host "  Note: getAllSites enumerates every site in the tenant across all geos." -ForegroundColor Gray
+    Write-Host "  Pass 1: bulk beta getAllSites (archivalDetails inline where available)." -ForegroundColor Gray
 
     $archivedSites = [System.Collections.Generic.List[object]]::new()
-    $personalSites = [System.Collections.Generic.List[object]]::new()
+    $sitesNeedingCheck = [System.Collections.Generic.List[object]]::new()
     $totalScanned = 0
 
-    # Step A: Enumerate all sites, collecting only personal OneDrive sites.
-    # archivalDetails.archiveStatus is documented as "Requires $select" on the
-    # siteCollection resource type, meaning it is NOT returned by the bulk getAllSites
-    # call even when siteCollection is in $select. It is only returned by an individual
-    # GET /sites/{id}?$select=siteCollection call. Archival status is checked in Step B.
-    $nextUri = "https://graph.microsoft.com/v1.0/sites/getAllSites?`$select=id,displayName,webUrl,isPersonalSite&`$top=200"
+    # Pass 1: Bulk enumeration via the beta endpoint with siteCollection in $select.
+    # On the beta endpoint, archivalDetails.archiveStatus is returned inline for archived
+    # personal sites when siteCollection is explicitly selected. Sites where it comes back
+    # populated are classified here with no further API call. Sites where it is null are
+    # queued for the per-site fallback in Pass 2.
+    $filterParam = [Uri]::EscapeDataString('isPersonalSite eq true')
+    $nextUri = "https://graph.microsoft.com/beta/sites/getAllSites?`$filter=$filterParam&`$select=id,displayName,webUrl,isPersonalSite,siteCollection&`$top=200"
 
     do {
         Test-ValidToken
@@ -724,108 +734,135 @@ function Get-ArchivedOneDriveSites {
             return $archivedSites
         }
 
-        $totalScanned += $response.value.Count
         foreach ($site in $response.value) {
-            if ($site.isPersonalSite) { $personalSites.Add($site) }
-        }
+            $totalScanned++
+            $archStatus = $site.siteCollection.archivalDetails.archiveStatus
 
-        Write-Host "  Sites scanned: $totalScanned | Personal OneDrives identified: $($personalSites.Count)..." -ForegroundColor Gray
-        $nextUri = $response.'@odata.nextLink'
-    } while ($nextUri)
+            if ($null -ne $archStatus) {
+                # archivalDetails returned inline — classify without a per-site call.
+                if ($archStatus -in @('reactivating', 'unknownFutureValue')) { continue }
 
-    Write-Host "  Enumeration complete. Checking archival status for $($personalSites.Count) personal sites..." -ForegroundColor Gray
-
-    # Step B: For each personal site, query archival status via individual GET.
-    # GET /sites/{id}?$select=siteCollection returns archivalDetails.archiveStatus
-    # correctly because the "Requires $select" constraint is satisfied at the resource level.
-    $checked = 0
-    foreach ($site in $personalSites) {
-        $checked++
-        if ($checked % 25 -eq 0 -or $checked -eq $personalSites.Count) {
-            Write-Host "  Archival status check: $checked / $($personalSites.Count) | Archived found: $($archivedSites.Count)..." -ForegroundColor Gray
-        }
-
-        Test-ValidToken
-        $headers = @{ Authorization = "Bearer $global:token" }
-        # Use the beta endpoint — v1.0 does not populate siteCollection.archivalDetails.
-        # For active (non-archived) personal sites the response returns normally and
-        # archivalDetails will be null, so we skip them.
-        # For ARCHIVED personal sites, Graph returns HTTP 423 Locked instead of a response
-        # body — the 423 is the reliable archival indicator, not a property in the response.
-        $siteUri = "https://graph.microsoft.com/beta/sites/$($site.id)?`$select=id,siteCollection"
-
-        try {
-            $siteDetail = Invoke-GraphRequestWithThrottleHandling -Uri $siteUri -Method GET -Headers $headers
-        }
-        catch {
-            $statusCode = $null
-            if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
-
-            # HTTP 423 Locked = the personal OneDrive site is archived by Microsoft.
-            # Graph refuses the metadata request for an archived site and returns 423.
-            # This is the only reliable signal — archivalDetails is never populated.
-            if ($statusCode -eq 423) {
                 $upn = ConvertTo-UPNFromSiteUrl -SiteUrl $site.webUrl
-                if ($debug) { Write-Host "  [ARCHIVED] 423 Locked — $($site.webUrl)" -ForegroundColor DarkGreen }
+                $driveInfo = Get-SiteDriveInfo -SiteId $site.id -SiteUrl $site.webUrl
+
+                $archNote = "archiveStatus: $archStatus"
+                $driveInfo.Note = if ($driveInfo.Note) { "$archNote | $($driveInfo.Note)" } else { $archNote }
+
+                if ($debug) { Write-Host "  [ARCHIVED-BULK] $archStatus — $($site.webUrl)" -ForegroundColor DarkGreen }
 
                 $archivedSites.Add([PSCustomObject]@{
-                        UserId            = ''
+                        UserId            = ''       # No Entra user object — user purged from recycle bin
                         UserPrincipalName = $upn
                         DisplayName       = $site.displayName
                         AccountEnabled    = $false
                         HasAnyLicense     = $false
                         UserSource        = 'Archived'
-                        UnlicensedDate    = $null
+                        UnlicensedDate    = $null    # Date unavailable — predates Entra purge (>30 days ago)
                         UnlicensedDueTo   = 'OneDrive archived by Microsoft'
-                        ArchiveStatus     = 'archived'
-                        DriveInfo         = [PSCustomObject]@{
-                            Found             = $true
-                            DriveId           = ''
-                            DriveWebUrl       = $site.webUrl
-                            DriveType         = 'business'
-                            StorageUsedGB     = ''
-                            StorageTotalGB    = ''
-                            DriveLastModified = ''
-                            Note              = 'Site is archived (HTTP 423 Locked) — storage details unavailable while archived'
-                        }
+                        ArchiveStatus     = $archStatus
+                        DriveInfo         = $driveInfo
                     })
             }
             else {
-                if ($debug) { Write-Host "  Warning: Could not get site details for $($site.webUrl): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                # archivalDetails was null in bulk response — queue for per-site fallback.
+                $sitesNeedingCheck.Add($site)
             }
-            continue
         }
 
-        # Dump raw JSON for the first successfully-returned site when debug is on
-        if ($debug -and $checked -eq 1) {
-            Write-Host "  [DEBUG] First active personal site raw response:" -ForegroundColor DarkGray
-            Write-Host ($siteDetail | ConvertTo-Json -Depth 6) -ForegroundColor DarkGray
+        Write-Host "  Scanned: $totalScanned | Archived (bulk): $($archivedSites.Count) | Pending per-site check: $($sitesNeedingCheck.Count)..." -ForegroundColor Gray
+        $nextUri = $response.'@odata.nextLink'
+    } while ($nextUri)
+
+    Write-Host "  Pass 1 complete. Archived (bulk): $($archivedSites.Count) | Sites needing per-site check: $($sitesNeedingCheck.Count)" -ForegroundColor Gray
+
+    # Pass 2: Per-site fallback for sites where bulk response did not include archivalDetails.
+    # GET /beta/sites/{id}?$select=id,siteCollection satisfies the "Requires $select" constraint
+    # at the individual resource level and returns archivalDetails for archived sites.
+    # HTTP 423 Locked is also treated as an archived signal — Graph refuses metadata
+    # requests for archived sites and returns 423 instead of a response body.
+    if ($sitesNeedingCheck.Count -gt 0) {
+        Write-Host "  Pass 2: Per-site archival check for $($sitesNeedingCheck.Count) sites..." -ForegroundColor Gray
+        $checked = 0
+        foreach ($site in $sitesNeedingCheck) {
+            $checked++
+            if ($checked % 25 -eq 0 -or $checked -eq $sitesNeedingCheck.Count) {
+                Write-Host "  Per-site check: $checked / $($sitesNeedingCheck.Count) | Archived found: $($archivedSites.Count)..." -ForegroundColor Gray
+            }
+
+            Test-ValidToken
+            $headers = @{ Authorization = "Bearer $global:token" }
+            $siteUri = "https://graph.microsoft.com/beta/sites/$($site.id)?`$select=id,siteCollection"
+
+            try {
+                $siteDetail = Invoke-GraphRequestWithThrottleHandling -Uri $siteUri -Method GET -Headers $headers
+            }
+            catch {
+                $statusCode = $null
+                if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
+
+                # HTTP 423 Locked = site is archived. Graph refuses the metadata request
+                # for an archived site and returns 423 rather than a response body.
+                if ($statusCode -eq 423) {
+                    $upn = ConvertTo-UPNFromSiteUrl -SiteUrl $site.webUrl
+                    if ($debug) { Write-Host "  [ARCHIVED-423] 423 Locked — $($site.webUrl)" -ForegroundColor DarkGreen }
+
+                    $archivedSites.Add([PSCustomObject]@{
+                            UserId            = ''
+                            UserPrincipalName = $upn
+                            DisplayName       = $site.displayName
+                            AccountEnabled    = $false
+                            HasAnyLicense     = $false
+                            UserSource        = 'Archived'
+                            UnlicensedDate    = $null
+                            UnlicensedDueTo   = 'OneDrive archived by Microsoft'
+                            ArchiveStatus     = 'archived'
+                            DriveInfo         = [PSCustomObject]@{
+                                Found             = $true
+                                DriveId           = ''
+                                DriveWebUrl       = $site.webUrl
+                                DriveType         = 'business'
+                                StorageUsedGB     = ''
+                                StorageTotalGB    = ''
+                                DriveLastModified = ''
+                                Note              = 'Site is archived (HTTP 423 Locked) — storage details unavailable while archived'
+                            }
+                        })
+                }
+                else {
+                    if ($debug) { Write-Host "  Warning: Could not get site details for $($site.webUrl): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                }
+                continue
+            }
+
+            # Dump raw JSON for the first successfully-returned site when debug is on
+            if ($debug -and $checked -eq 1) {
+                Write-Host "  [DEBUG] First per-site fallback response:" -ForegroundColor DarkGray
+                Write-Host ($siteDetail | ConvertTo-Json -Depth 6) -ForegroundColor DarkGray
+            }
+
+            $archStatus = $siteDetail.siteCollection.archivalDetails.archiveStatus
+            if ($null -eq $archStatus) { continue }
+            if ($archStatus -in @('reactivating', 'unknownFutureValue')) { continue }
+
+            $upn = ConvertTo-UPNFromSiteUrl -SiteUrl $site.webUrl
+            $driveInfo = Get-SiteDriveInfo -SiteId $site.id -SiteUrl $site.webUrl
+
+            $archNote = "archiveStatus: $archStatus"
+            $driveInfo.Note = if ($driveInfo.Note) { "$archNote | $($driveInfo.Note)" } else { $archNote }
+
+            $archivedSites.Add([PSCustomObject]@{
+                    UserId            = ''       # No Entra user object — user purged from recycle bin
+                    UserPrincipalName = $upn
+                    DisplayName       = $site.displayName
+                    AccountEnabled    = $false
+                    HasAnyLicense     = $false
+                    UserSource        = 'Archived'
+                    UnlicensedDate    = $null    # Date unavailable — predates Entra purge (>30 days ago)
+                    UnlicensedDueTo   = 'OneDrive archived by Microsoft'
+                    ArchiveStatus     = $archStatus
+                    DriveInfo         = $driveInfo
+                })
         }
-
-        # Active sites: archivalDetails will be null — skip them.
-        # (Kept for forward-compatibility in case Graph populates it in a future rollout.)
-        $archStatus = $siteDetail.siteCollection.archivalDetails.archiveStatus
-        if ($null -eq $archStatus) { continue }
-        if ($archStatus -in @('reactivating', 'unknownFutureValue')) { continue }
-
-        $upn = ConvertTo-UPNFromSiteUrl -SiteUrl $site.webUrl
-        $driveInfo = Get-SiteDriveInfo -SiteId $site.id -SiteUrl $site.webUrl
-
-        $archNote = "archiveStatus: $archStatus"
-        $driveInfo.Note = if ($driveInfo.Note) { "$archNote | $($driveInfo.Note)" } else { $archNote }
-
-        $archivedSites.Add([PSCustomObject]@{
-                UserId            = ''       # No Entra user object — user purged from recycle bin
-                UserPrincipalName = $upn
-                DisplayName       = $site.displayName
-                AccountEnabled    = $false
-                HasAnyLicense     = $false
-                UserSource        = 'Archived'
-                UnlicensedDate    = $null    # Date unavailable — predates Entra purge (>30 days ago)
-                UnlicensedDueTo   = 'OneDrive archived by Microsoft'
-                ArchiveStatus     = $archStatus
-                DriveInfo         = $driveInfo
-            })
     }
 
     Write-Host "  Sites enumeration complete. Archived personal OneDrives: $($archivedSites.Count)" -ForegroundColor Green
