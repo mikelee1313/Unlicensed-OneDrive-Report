@@ -47,7 +47,7 @@
 
 .NOTES
     File Name   : Get-UnlicensedOneDriveReport.ps1
-    Author      : Mike Lee
+    Author      : Mike Lee | Mariel Williams
     Date Created: 4/28/26
     Date Updated: 4/30/26 added cost estimation and email notification features
 
