@@ -47,7 +47,7 @@
 
 .NOTES
     File Name   : Get-UnlicensedOneDriveReport.ps1
-    Author      : Mike Lee | Mariel Williams
+    Author      : Mike Lee
     Date Created: 4/28/26
 
     Required Microsoft Graph App Permissions (Application type):
@@ -58,6 +58,9 @@
                                  Set $includeLicenseRemovalDates = $false to skip.
       Sites.Read.All          — [OPTIONAL] GET /sites/getAllSites for currently archived OneDrive sites
                                  Set $GetCurrentlyArchived = $false to skip.
+      Mail.Send               — [OPTIONAL] Send alert emails via Graph API (POST /users/{sender}/sendMail)
+                                 Set $SendEmailNotifications = $false to skip.
+                                 The $EmailFrom mailbox must be a licensed Exchange Online mailbox.
 
     A SINGLE app registration in the HOME TENANT covers all geo locations.
     No per-geo tokens required — Graph handles multi-geo routing automatically.
@@ -133,6 +136,34 @@ $RequestTimeoutSec = 300
 # ---- Delay between individual drive queries (seconds). 0 = no delay. ----
 $delayBetweenRequests = 0
 
+# ---- Cost estimation rates — per Microsoft unlicensed OneDrive pricing ----
+# https://learn.microsoft.com/en-us/sharepoint/unlicensed-onedrive-accounts
+$ArchivalStorageCostPerGBMonth = 0.05   # USD per GB per month — ongoing storage fee for archived OneDrives (past Day 93)
+$ReactivationCostPerGB = 0.60   # USD per GB one-time fee to reactivate an archived OneDrive
+
+# ---- Email Notifications ----
+# Set $SendEmailNotifications = $true to send alert emails to admins after the report runs.
+# Two separate emails are sent when accounts fall within the configured day thresholds:
+#   (1) Approaching Read-Only  — when DaysUntilReadOnly  <= $DaysToNotifyBeforeReadOnly
+#   (2) Approaching Archive    — when DaysUntilArchive   <= $DaysToNotifyBeforeArchive
+$SendEmailNotifications = $true
+
+# Recipients — individual addresses or mail-enabled group/distribution-list addresses.
+$EmailTo = @(
+    'admin@M365CPI13246019.onmicrosoft.com'
+    'Test-Email-Security-Group@M365CPI13246019.onmicrosoft.com'
+)
+
+# Sender address — must be a licensed Exchange Online mailbox in the tenant.
+# The app registration must have Mail.Send (Application) permission granted in Entra ID.
+# Email is sent via Graph API (POST /users/{EmailFrom}/sendMail) — no SMTP relay needed.
+$EmailFrom = 'admin@M365CPI13246019.onmicrosoft.com'
+
+# Notification windows — an alert email is sent when a site's days-until-event falls
+# at or below this value. Set to 0 to only notify on the day of the event itself.
+$DaysToNotifyBeforeReadOnly = 14   # Notify admins this many days before a site goes read-only
+$DaysToNotifyBeforeArchive = 14   # Notify admins this many days before a site is archived
+
 ##############################################################
 #                END CONFIGURATION SECTION                   #
 ##############################################################
@@ -145,6 +176,9 @@ $outputLog = Join-Path $OutputFolder "UnlicensedOneDrive_$date.csv"
 
 $global:token = $null
 $global:tokenExpiry = $null
+
+# Required for HTML-encoding display names and UPNs in alert email bodies
+Add-Type -AssemblyName System.Web
 #endregion Initialization
 
 #region Constants — OneDrive & SharePoint Online Service Plan IDs
@@ -594,7 +628,6 @@ function Get-UserDriveInfo {
             Found             = $true
             DriveId           = $drive.id
             DriveWebUrl       = $drive.webUrl
-            DriveType         = $drive.driveType
             StorageUsedGB     = $storageUsedGB
             StorageTotalGB    = $storageTotalGB
             DriveLastModified = $drive.lastModifiedDateTime
@@ -618,7 +651,6 @@ function Get-UserDriveInfo {
             Found             = $false
             DriveId           = ''
             DriveWebUrl       = ''
-            DriveType         = ''
             StorageUsedGB     = ''
             StorageTotalGB    = ''
             DriveLastModified = ''
@@ -654,7 +686,6 @@ function Get-SiteDriveInfo {
             Found             = $true
             DriveId           = $drive.id
             DriveWebUrl       = if ($drive.webUrl) { $drive.webUrl } else { $SiteUrl }
-            DriveType         = $drive.driveType
             StorageUsedGB     = $storageUsedGB
             StorageTotalGB    = $storageTotalGB
             DriveLastModified = $drive.lastModifiedDateTime
@@ -677,7 +708,6 @@ function Get-SiteDriveInfo {
             Found             = $true
             DriveId           = ''
             DriveWebUrl       = $SiteUrl
-            DriveType         = ''
             StorageUsedGB     = ''
             StorageTotalGB    = ''
             DriveLastModified = ''
@@ -820,7 +850,6 @@ function Get-ArchivedOneDriveSites {
                                 Found             = $true
                                 DriveId           = ''
                                 DriveWebUrl       = $site.webUrl
-                                DriveType         = 'business'
                                 StorageUsedGB     = ''
                                 StorageTotalGB    = ''
                                 DriveLastModified = ''
@@ -925,25 +954,42 @@ function Add-MilestoneCalculations {
 
         $driveInfo = $acct.DriveInfo
 
+        # Cost estimation — projected costs for all accounts with known storage.
+        # Archived accounts show what they are actively costing; pre-archive accounts
+        # show what they will cost if unlicensed status continues to Day 93.
+        $projMonthlyStorageCost = $null
+        $projReactivationCost = $null
+
+        $storageGB = $null
+        if ($null -ne $driveInfo.StorageUsedGB -and $driveInfo.StorageUsedGB -ne '') {
+            try { $storageGB = [double]$driveInfo.StorageUsedGB } catch {}
+        }
+
+        if ($null -ne $storageGB) {
+            $projMonthlyStorageCost = [Math]::Round($storageGB * $script:ArchivalStorageCostPerGBMonth, 2)
+            $projReactivationCost = [Math]::Round($storageGB * $script:ReactivationCostPerGB, 2)
+        }
+
         $enriched.Add([PSCustomObject]@{
-                UserSource          = $acct.UserSource
-                DisplayName         = $acct.DisplayName
-                UserPrincipalName   = $acct.UserPrincipalName
-                AccountEnabled      = $acct.AccountEnabled
-                UnlicensedDueTo     = $acct.UnlicensedDueTo
-                UnlicensedDate      = if ($unlicensedDate) { $unlicensedDate.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
-                DaysSinceUnlicensed = $daysSinceUnlicensed
-                ReadOnlyDate        = if ($readOnlyDate) { $readOnlyDate.ToString('yyyy-MM-dd') } else { '' }
-                ArchiveDate         = if ($archiveDate) { $archiveDate.ToString('yyyy-MM-dd') } else { '' }
-                DaysUntilReadOnly   = $daysUntilReadOnly
-                DaysUntilArchive    = $daysUntilArchive
-                UrgencyStatus       = $urgencyStatus
-                StorageUsedGB       = $driveInfo.StorageUsedGB
-                StorageTotalGB      = $driveInfo.StorageTotalGB
-                DriveUrl            = $driveInfo.DriveWebUrl
-                DriveLastModified   = $driveInfo.DriveLastModified
-                DriveType           = $driveInfo.DriveType
-                Notes               = $driveInfo.Note
+                UserSource             = $acct.UserSource
+                DisplayName            = $acct.DisplayName
+                UserPrincipalName      = $acct.UserPrincipalName
+                AccountEnabled         = $acct.AccountEnabled
+                UnlicensedDueTo        = $acct.UnlicensedDueTo
+                UnlicensedDate         = if ($unlicensedDate) { $unlicensedDate.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+                DaysSinceUnlicensed    = $daysSinceUnlicensed
+                ReadOnlyDate           = if ($readOnlyDate) { $readOnlyDate.ToString('yyyy-MM-dd') } else { '' }
+                ArchiveDate            = if ($archiveDate) { $archiveDate.ToString('yyyy-MM-dd') } else { '' }
+                DaysUntilReadOnly      = $daysUntilReadOnly
+                DaysUntilArchive       = $daysUntilArchive
+                UrgencyStatus          = $urgencyStatus
+                StorageUsedGB          = $driveInfo.StorageUsedGB
+                StorageTotalGB         = $driveInfo.StorageTotalGB
+                ProjMonthlyStorageCost = $projMonthlyStorageCost
+                ProjReactivationCost   = $projReactivationCost
+                DriveUrl               = $driveInfo.DriveWebUrl
+                DriveLastModified      = $driveInfo.DriveLastModified
+                Notes                  = $driveInfo.Note
             })
     }
 
@@ -988,9 +1034,166 @@ function Write-ConsoleSummary {
         }
         Write-Host ("    {0,-45} {1,5} accounts" -f $_.Name, $_.Count) -ForegroundColor $color
     }
+
+    $projectedWithCost = $Records | Where-Object { $null -ne $_.ProjMonthlyStorageCost }
+    if ($projectedWithCost) {
+        $totalProjMonthly = ($projectedWithCost | Measure-Object -Property ProjMonthlyStorageCost -Sum).Sum
+        $totalProjReactivation = ($projectedWithCost | Measure-Object -Property ProjReactivationCost   -Sum).Sum
+        Write-Host "`n  Projected Costs (@ Microsoft unlicensed OneDrive pricing):" -ForegroundColor White
+        Write-Host "  Note: Archived accounts reflect active ongoing costs. Pre-archive accounts show projected costs if they reach Day 93." -ForegroundColor Gray
+        Write-Host ("    Monthly storage cost  (@`$0.05/GB/month) : `${0:N2} USD/month" -f $totalProjMonthly)      -ForegroundColor Yellow
+        Write-Host ("    Reactivation cost     (@`$0.60/GB)       : `${0:N2} USD one-time" -f $totalProjReactivation) -ForegroundColor Yellow
+        Write-Host ("    Accounts with storage data: {0} of {1} total" -f $projectedWithCost.Count, $Records.Count) -ForegroundColor Gray
+    }
+    else {
+        Write-Host "`n  Projected Costs: No accounts with storage data available for cost estimation." -ForegroundColor Gray
+    }
 }
 
 #endregion Output Functions
+
+#region Email Functions
+
+function Send-OneDriveAlertEmail {
+    <#
+    .SYNOPSIS
+        Sends an HTML alert email to the admin list ($EmailTo) summarising OneDrive
+        accounts that are within the configured notification window before going
+        read-only or being archived.
+
+        Called once per notification type after the report is generated.
+        Uses the Microsoft Graph API (POST /users/{EmailFrom}/sendMail) with the
+        existing bearer token — no SMTP relay required.
+        Requires $SendEmailNotifications = $true and Mail.Send (Application) on the app registration.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)] [ValidateSet('ReadOnly', 'Archive')] [string]   $NotificationType,
+        [Parameter(Mandatory)] [object[]]                            $AffectedAccounts,
+        [Parameter(Mandatory)] [int]                                 $ThresholdDays
+    )
+
+    if ($AffectedAccounts.Count -eq 0) { return }
+
+    $thresholdLabel = if ($NotificationType -eq 'ReadOnly') { 'Read-Only' } else { 'Archive' }
+    $thresholdDay = if ($NotificationType -eq 'ReadOnly') { $script:ReadOnlyThresholdDays } else { $script:ArchiveThresholdDays }
+
+    # --- Subject line ---
+    $subject = "[OneDrive Alert] $($AffectedAccounts.Count) account(s) approaching $thresholdLabel within $ThresholdDays day(s) — Tenant: $script:tenantId"
+
+    # --- Build HTML table rows, sorted by days remaining (most urgent first) ---
+    $sortedAccounts = $AffectedAccounts | Sort-Object {
+        if ($NotificationType -eq 'ReadOnly') { $_.DaysUntilReadOnly } else { $_.DaysUntilArchive }
+    }
+
+    $tableRows = foreach ($acct in $sortedAccounts) {
+        $daysRemaining = if ($NotificationType -eq 'ReadOnly') { $acct.DaysUntilReadOnly } else { $acct.DaysUntilArchive }
+        $targetDate = if ($NotificationType -eq 'ReadOnly') { $acct.ReadOnlyDate }      else { $acct.ArchiveDate }
+        $storageText = if ($acct.StorageUsedGB -ne '') { "$($acct.StorageUsedGB) GB" } else { 'N/A' }
+
+        # Row colour: red shading ≤ 3 days, amber ≤ 7 days, white otherwise
+        $rowColor = if ($daysRemaining -le 3) { '#fde8e8' } elseif ($daysRemaining -le 7) { '#fff3cd' } else { '#ffffff' }
+
+        $safeName = [System.Web.HttpUtility]::HtmlEncode($acct.DisplayName)
+        $safeUpn = [System.Web.HttpUtility]::HtmlEncode($acct.UserPrincipalName)
+        $safeStatus = [System.Web.HttpUtility]::HtmlEncode($acct.UrgencyStatus)
+
+        "<tr style='background-color:$rowColor;'>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$safeName</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$safeUpn</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$($acct.UserSource)</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;text-align:right;'>$storageText</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$targetDate</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;text-align:center;'>$daysRemaining</td>
+          <td style='padding:5px 10px;border:1px solid #d0d0d0;'>$safeStatus</td>
+        </tr>"
+    }
+
+    $headerColor = if ($NotificationType -eq 'ReadOnly') { '#1a5276' } else { '#7b241c' }
+    $alertHeading = if ($NotificationType -eq 'ReadOnly') {
+        "OneDrive Read-Only Alert — $($AffectedAccounts.Count) account(s) go read-only within $ThresholdDays day(s)"
+    }
+    else {
+        "OneDrive Archive Alert — $($AffectedAccounts.Count) account(s) will be archived within $ThresholdDays day(s)"
+    }
+
+    $body = @"
+<!DOCTYPE html>
+<html>
+<body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222;margin:20px;">
+  <h2 style="color:$headerColor;margin-bottom:4px;">$alertHeading</h2>
+  <p style="margin-top:0;color:#555;font-size:13px;">
+    Tenant: <strong>$script:tenantId</strong> &nbsp;|&nbsp;
+    Report date: <strong>$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</strong> &nbsp;|&nbsp;
+    Threshold: Day <strong>$thresholdDay</strong>
+  </p>
+  <p>
+    The accounts below have not been relicensed and are within
+    <strong>$ThresholdDays day(s)</strong> of going <strong>$thresholdLabel</strong>.
+    Please review and take action (relicense, transfer data, or delete).
+  </p>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+    <thead>
+      <tr style="background-color:$headerColor;color:#fff;">
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">Display Name</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">UPN</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">Source</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:right;">Storage Used</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">$thresholdLabel Date</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:center;">Days Left</th>
+        <th style="padding:6px 10px;border:1px solid #999;text-align:left;">Urgency</th>
+      </tr>
+    </thead>
+    <tbody>
+      $($tableRows -join "`n      ")
+    </tbody>
+  </table>
+  <br/>
+  <p style="font-size:12px;color:#888;">
+    Full report saved to: $script:outputLog<br/>
+    Generated by Get-UnlicensedOneDriveReport.ps1
+  </p>
+</body>
+</html>
+"@
+
+    # Build the Graph sendMail payload.
+    # toRecipients is constructed from the $EmailTo array — each address becomes
+    # a separate emailAddress object so both individual mailboxes and mail-enabled
+    # groups are handled correctly.
+    $toRecipients = @($script:EmailTo | ForEach-Object {
+            @{ emailAddress = @{ address = $_ } }
+        })
+
+    $graphMailBody = @{
+        message         = @{
+            subject      = $subject
+            body         = @{ contentType = 'HTML'; content = $body }
+            toRecipients = $toRecipients
+        }
+        saveToSentItems = $false
+    } | ConvertTo-Json -Depth 6 -Compress
+
+    # The sender mailbox must match $EmailFrom. With app-only auth the call is
+    # POST /users/{sender}/sendMail — /me is not valid for client-credentials tokens.
+    $sendUri = "https://graph.microsoft.com/v1.0/users/$([Uri]::EscapeDataString($script:EmailFrom))/sendMail"
+
+    Test-ValidToken
+    $headers = @{ Authorization = "Bearer $global:token" }
+
+    try {
+        Invoke-GraphRequestWithThrottleHandling -Uri $sendUri -Method POST -Headers $headers `
+            -Body $graphMailBody -ContentType 'application/json'
+        Write-Host "  [$thresholdLabel alert] Email sent to: $($script:EmailTo -join ', ')" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  [$thresholdLabel alert] Email send failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  Verify: Mail.Send (Application) is granted for app '$script:clientId' in Entra ID." -ForegroundColor Yellow
+        Write-Host "  Sender mailbox '$script:EmailFrom' must be a licensed Exchange Online mailbox." -ForegroundColor Yellow
+    }
+}
+
+#endregion Email Functions
 
 #region Main Execution
 
@@ -1163,6 +1366,51 @@ if ($sorted.Count -gt 0) {
 }
 else {
     Write-Host "`nNo unlicensed OneDrive accounts with active drives found." -ForegroundColor Green
+}
+
+# Step 10: Email notifications
+if ($SendEmailNotifications) {
+    Write-Host "`nStep 10: Sending email notifications..." -ForegroundColor Cyan
+
+    if ($sorted.Count -eq 0) {
+        Write-Host "  No accounts in report — skipping email." -ForegroundColor Gray
+    }
+    else {
+        # Read-Only alert — accounts whose read-only date is within the configured window.
+        # Excludes accounts already past read-only (DaysUntilReadOnly < 0) since those
+        # are covered by the separate Archive alert.
+        $readOnlyAlert = @($sorted | Where-Object {
+                $null -ne $_.DaysUntilReadOnly -and
+                $_.DaysUntilReadOnly -ge 0 -and
+                $_.DaysUntilReadOnly -le $DaysToNotifyBeforeReadOnly
+            })
+
+        # Archive alert — accounts whose archive date is within the configured window.
+        $archiveAlert = @($sorted | Where-Object {
+                $null -ne $_.DaysUntilArchive -and
+                $_.DaysUntilArchive -ge 0 -and
+                $_.DaysUntilArchive -le $DaysToNotifyBeforeArchive
+            })
+
+        if ($readOnlyAlert.Count -gt 0) {
+            Write-Host "  Read-Only alert: $($readOnlyAlert.Count) account(s) within $DaysToNotifyBeforeReadOnly day(s) of read-only." -ForegroundColor Yellow
+            Send-OneDriveAlertEmail -NotificationType ReadOnly -AffectedAccounts $readOnlyAlert -ThresholdDays $DaysToNotifyBeforeReadOnly
+        }
+        else {
+            Write-Host "  Read-Only alert: No accounts within $DaysToNotifyBeforeReadOnly day(s) of read-only — email skipped." -ForegroundColor Gray
+        }
+
+        if ($archiveAlert.Count -gt 0) {
+            Write-Host "  Archive alert  : $($archiveAlert.Count) account(s) within $DaysToNotifyBeforeArchive day(s) of archive." -ForegroundColor Yellow
+            Send-OneDriveAlertEmail -NotificationType Archive -AffectedAccounts $archiveAlert -ThresholdDays $DaysToNotifyBeforeArchive
+        }
+        else {
+            Write-Host "  Archive alert  : No accounts within $DaysToNotifyBeforeArchive day(s) of archive — email skipped." -ForegroundColor Gray
+        }
+    }
+}
+else {
+    Write-Host "`nStep 10: Email notifications skipped (`$SendEmailNotifications = `$false)." -ForegroundColor Gray
 }
 
 #endregion Main Execution
