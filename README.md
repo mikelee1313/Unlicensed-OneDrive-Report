@@ -434,5 +434,5 @@ Add `Mail.Send` (**Application** type, not Delegated) to the app registration an
 
 ## Author
 
-**Mike Lee**  
+**Mike Lee**  | **Mariel Williams**
 Created: April 28, 2026
