@@ -371,6 +371,13 @@ Phase 2b makes **two Graph calls per personal OneDrive site** (one individual si
 
 When `$SendEmailNotifications = $true`, the script sends up to two HTML alert emails after the report is generated — one for accounts approaching read-only and one for accounts approaching archive. Emails are delivered via the **Microsoft Graph API** (`POST /users/{sender}/sendMail`) using the same bearer token already acquired for data collection. No SMTP relay, no credentials, and no deprecated `Send-MailMessage` cmdlet are used.
 
+Example E-mails:
+
+<img width="1902" height="644" alt="image" src="https://github.com/user-attachments/assets/0b129cb9-e0cc-4ce9-b31d-69cd574378b1" />
+
+<img width="1255" height="412" alt="image" src="https://github.com/user-attachments/assets/5bc5f7be-9310-4b2d-adc6-49e11705d0c4" />
+
+
 ### Configuration
 
 | Variable | Default | Description |
