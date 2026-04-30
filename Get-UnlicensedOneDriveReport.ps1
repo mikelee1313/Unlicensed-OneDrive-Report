@@ -147,7 +147,7 @@ $ReactivationCostPerGB = 0.60   # USD per GB one-time fee to reactivate an archi
 # Two separate emails are sent when accounts fall within the configured day thresholds:
 #   (1) Approaching Read-Only  — when DaysUntilReadOnly  <= $DaysToNotifyBeforeReadOnly
 #   (2) Approaching Archive    — when DaysUntilArchive   <= $DaysToNotifyBeforeArchive
-$SendEmailNotifications = $true
+$SendEmailNotifications = $false
 
 # Recipients — individual addresses or mail-enabled group/distribution-list addresses.
 $EmailTo = @(
