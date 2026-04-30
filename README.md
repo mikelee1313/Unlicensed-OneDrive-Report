@@ -39,6 +39,7 @@ This script scans the entire tenant, identifies **three populations** of unlicen
 - ✅ **Throttle handling** — exponential backoff with Retry-After support (429, 502, 503, 504)
 - ✅ **Traffic-light urgency labels** — `CRITICAL`, `WARNING`, `MONITOR`, `OK`, `ARCHIVED`
 - ✅ **UTF-8 BOM CSV output** — Excel-safe encoding
+- ✅ **Email alert notifications** — sends HTML alert emails via Microsoft Graph API (`Mail.Send`) to a configurable list of admins/groups before sites go read-only or are archived. No SMTP relay required.
 
 ---
 
@@ -57,6 +58,7 @@ A single app registration in the **home tenant** is required. The app must be gr
 | `Files.Read.All` | ✅ Required | Read OneDrive drive metadata for any user across all geo locations |
 | `AuditLog.Read.All` | ⚠️ Optional | Query `directoryAudits` to find the exact license removal date. Set `$includeLicenseRemovalDates = $false` to skip. |
 | `Sites.Read.All` | ⚠️ Optional | Enumerate all SharePoint sites via `GET /sites/getAllSites` to find personal OneDrive sites already archived by Microsoft. Set `$GetCurrentlyArchived = $false` to skip. |
+| `Mail.Send` | ⚠️ Optional | Send HTML alert emails via Graph API (`POST /users/{sender}/sendMail`). Set `$SendEmailNotifications = $false` to skip. The `$EmailFrom` address must be a licensed Exchange Online mailbox. |
 
 ### Authentication
 The script supports two authentication methods. Configure one in the `#region Configuration` block:
@@ -111,6 +113,16 @@ $RequestTimeoutSec   = 300
 
 # Optional delay between OneDrive drive queries (seconds). 0 = no delay.
 $delayBetweenRequests = 0
+
+# Email notifications (requires Mail.Send Application permission)
+$SendEmailNotifications    = $false          # Set $true to enable
+$EmailTo                   = @(
+    'admin@contoso.com'                       # Individual address or mail-enabled group
+    'it-admins@contoso.com'
+)
+$EmailFrom                 = 'onedrive-alerts@contoso.com'   # Licensed Exchange Online mailbox
+$DaysToNotifyBeforeReadOnly = 14             # Alert X days before read-only
+$DaysToNotifyBeforeArchive  = 14             # Alert X days before archive
 ```
 
 ---
@@ -222,6 +234,25 @@ The script executes in **5 phases** (plus Phase 2b) plus initialization and outp
 │  Exports UTF-8 BOM CSV to $OutputFolder                         │
 │  Prints summary to console (by source and by urgency)           │
 │  File: UnlicensedOneDrive_<yyyyMMddHHmmss>.csv                 │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 10 — Email Notifications (optional)                       │
+│  Skipped if $SendEmailNotifications = $false                    │
+│                                                                 │
+│  Two alerts fired independently:                                │
+│    (1) Read-Only alert — accounts where DaysUntilReadOnly       │
+│        is >= 0 and <= $DaysToNotifyBeforeReadOnly               │
+│    (2) Archive alert  — accounts where DaysUntilArchive         │
+│        is >= 0 and <= $DaysToNotifyBeforeArchive                │
+│                                                                 │
+│  Each alert sends one HTML email via Graph API:                 │
+│    POST /users/{EmailFrom}/sendMail                             │
+│  Uses the existing bearer token — no SMTP relay required        │
+│  Supports individual mailboxes and mail-enabled groups in       │
+│  $EmailTo                                                       │
+│  Requires Mail.Send (Application) on the app registration       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -336,12 +367,48 @@ Phase 2b makes **two Graph calls per personal OneDrive site** (one individual si
 
 ---
 
+## Email Notifications
+
+When `$SendEmailNotifications = $true`, the script sends up to two HTML alert emails after the report is generated — one for accounts approaching read-only and one for accounts approaching archive. Emails are delivered via the **Microsoft Graph API** (`POST /users/{sender}/sendMail`) using the same bearer token already acquired for data collection. No SMTP relay, no credentials, and no deprecated `Send-MailMessage` cmdlet are used.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `$SendEmailNotifications` | `$false` | Master on/off toggle. Set to `$true` to enable. |
+| `$EmailTo` | *(array)* | One or more recipient addresses. Accepts individual mailboxes and mail-enabled groups/distribution lists. |
+| `$EmailFrom` | *(string)* | Sender address. Must be a **licensed Exchange Online mailbox** in the tenant. |
+| `$DaysToNotifyBeforeReadOnly` | `14` | Send the read-only alert when `DaysUntilReadOnly` is at or below this value. Set to `0` to alert only on the day of the event. |
+| `$DaysToNotifyBeforeArchive` | `14` | Send the archive alert when `DaysUntilArchive` is at or below this value. |
+
+### Email content
+
+Each alert email contains:
+- A colour-coded HTML table of affected accounts (red ≤ 3 days remaining, amber ≤ 7 days, white otherwise)
+- Columns: Display Name, UPN, Source, Storage Used, target date, days remaining, urgency status
+- Tenant ID, report run date, and the relevant Day threshold in the header
+- Path to the exported CSV report
+
+### Required permission
+
+Add `Mail.Send` (**Application** type, not Delegated) to the app registration and grant admin consent:
+
+1. **Entra admin center** → App registrations → your app → **API permissions**
+2. **Add a permission** → Microsoft Graph → Application permissions → `Mail.Send`
+3. **Grant admin consent** for the tenant
+
+> ⚠️ `$EmailFrom` must be a user with an active Exchange Online mailbox (E1/E3/E5, Exchange Online Plan 1/2, or equivalent). A cloud-only account without an Exchange license will return HTTP 403.
+
+---
+
 ## Security Notes
 
 - **Certificate authentication is recommended** over client secrets for production use
 - The script uses `GetRSAPrivateKey()` (supports both CAPI and CNG/KSP certificate providers) rather than the legacy `.PrivateKey` property
 - Do not store client secrets in the script file — use environment variables or a secrets manager
-- The app registration requires only **read** permissions — no write access to any resource
+- The core app registration requires only **read** permissions — no write access to any resource
+- `Mail.Send` (Application) is the only write-capable permission and is entirely optional — set `$SendEmailNotifications = $false` to run without it
+- Email is sent via Graph API using the existing access token — no SMTP credentials are stored or transmitted
 
 ---
 
@@ -353,11 +420,12 @@ Phase 2b makes **two Graph calls per personal OneDrive site** (one individual si
 - [Graph API: List directoryAudits](https://learn.microsoft.com/en-us/graph/api/directoryaudit-list)
 - [Graph API: List all sites (getAllSites)](https://learn.microsoft.com/en-us/graph/api/site-getallsites)
 - [Graph API: siteArchivalDetails resource](https://learn.microsoft.com/en-us/graph/api/resources/sitearchivaldetails)
+- [Graph API: Send mail](https://learn.microsoft.com/en-us/graph/api/user-sendmail)
 - [Service plan identifiers for licensing](https://learn.microsoft.com/en-us/entra/identity/users/licensing-service-plan-reference)
 
 ---
 
 ## Author
 
-**Mike Lee**  | **Mariel Williams**
+**Mike Lee**  
 Created: April 28, 2026
