@@ -49,6 +49,7 @@
     File Name   : Get-UnlicensedOneDriveReport.ps1
     Author      : Mike Lee
     Date Created: 4/28/26
+    Date Updated: 4/30/26 added cost estimation and email notification features
 
     Required Microsoft Graph App Permissions (Application type):
       User.Read.All           — Enumerate users and inspect assignedPlans/licenses
