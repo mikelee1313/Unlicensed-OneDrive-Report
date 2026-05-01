@@ -387,6 +387,8 @@ Example E-mails:
 | `$EmailFrom` | *(string)* | Sender address. Must be a **licensed Exchange Online mailbox** in the tenant. |
 | `$DaysToNotifyBeforeReadOnly` | `14` | Send the read-only alert when `DaysUntilReadOnly` is at or below this value. Set to `0` to alert only on the day of the event. |
 | `$DaysToNotifyBeforeArchive` | `14` | Send the archive alert when `DaysUntilArchive` is at or below this value. |
+| `$GetCurrentlyArchived` | `$false` | When $true: queries GET /sites/getAllSites to find personal OneDrive sites that Microsoft has already archived. |
+
 
 ### Email content
 
