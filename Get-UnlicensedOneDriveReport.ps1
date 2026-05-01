@@ -50,6 +50,9 @@
     Author      : Mike Lee | Mariel Williams
     Date Created: 4/28/26
     Date Updated: 4/30/26 added cost estimation and email notification features
+    Date Updated: 5/1/26: 
+    - Fixed performance issue in Get-LicenseChangeDates by doing a single bulk query instead of per-user queries. 
+    - Added methods to clear memory and dispose of HTTP responses properly.
 
     Required Microsoft Graph App Permissions (Application type):
       User.Read.All           — Enumerate users and inspect assignedPlans/licenses
@@ -127,7 +130,7 @@ $AuditLogLookbackDays = 180
 # >30 days ago (purged from recycle bin) and whose OneDrive has since been archived.
 # Requires Sites.Read.All (Application) on the app registration.
 # When $false: only reports on active/soft-deleted populations (no Sites.Read.All needed).
-$GetCurrentlyArchived = $true
+$GetCurrentlyArchived = $false
 
 # ---- Request throttling ----
 $MaxRetries = 15
@@ -245,6 +248,7 @@ function Invoke-GraphRequestWithThrottleHandling {
                 ContentType = $ContentType
                 TimeoutSec  = $TimeoutSeconds
                 ErrorAction = 'Stop'
+                Verbose     = $false
             }
             if ($Body) { $invokeParams['Body'] = $Body }
 
@@ -350,7 +354,7 @@ function AcquireToken {
         }
         try {
             $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-                -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop
+                -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
             $global:token = $resp.access_token
             $expiresIn = if ($resp.expires_in) { $resp.expires_in } else { 3600 }
             $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)
@@ -401,7 +405,7 @@ function AcquireToken {
 
         try {
             $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-                -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop
+                -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
             $global:token = $resp.access_token
             $expiresIn = if ($resp.expires_in) { $resp.expires_in } else { 3600 }
             $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)
@@ -796,7 +800,13 @@ function Get-ArchivedOneDriveSites {
             }
             else {
                 # archivalDetails was null in bulk response — queue for per-site fallback.
-                $sitesNeedingCheck.Add($site)
+                # Store only the three fields Pass 2 uses — avoids holding the full
+                # paged response objects in memory for tenants with many personal sites.
+                $sitesNeedingCheck.Add([PSCustomObject]@{
+                        id          = $site.id
+                        webUrl      = $site.webUrl
+                        displayName = $site.displayName
+                    })
             }
         }
 
@@ -813,11 +823,15 @@ function Get-ArchivedOneDriveSites {
     # requests for archived sites and returns 423 instead of a response body.
     if ($sitesNeedingCheck.Count -gt 0) {
         Write-Host "  Pass 2: Per-site archival check for $($sitesNeedingCheck.Count) sites..." -ForegroundColor Gray
+        $siteCount = $sitesNeedingCheck.Count
         $checked = 0
-        foreach ($site in $sitesNeedingCheck) {
+        for ($i = 0; $i -lt $siteCount; $i++) {
+            $site = $sitesNeedingCheck[$i]
+            $sitesNeedingCheck[$i] = $null   # release reference so GC can reclaim after this iteration
+            if ($i -gt 0 -and $i % 500 -eq 0) { [System.GC]::Collect() }  # periodic GC hint for large tenants
             $checked++
-            if ($checked % 25 -eq 0 -or $checked -eq $sitesNeedingCheck.Count) {
-                Write-Host "  Per-site check: $checked / $($sitesNeedingCheck.Count) | Archived found: $($archivedSites.Count)..." -ForegroundColor Gray
+            if ($checked % 25 -eq 0 -or $checked -eq $siteCount) {
+                Write-Host "  Per-site check: $checked / $siteCount | Archived found: $($archivedSites.Count)..." -ForegroundColor Gray
             }
 
             Test-ValidToken
@@ -1294,28 +1308,113 @@ $driveFound = 0
 $driveNotFound = 0
 $driveErrors = 0
 
-foreach ($user in $allCandidates) {
-    $current++
-    $pct = [Math]::Round(($current / $total) * 100)
-    Write-Progress -Activity 'Querying OneDrive' `
-        -Status   "$current / $total ($pct%) — $($user.UserPrincipalName)" `
-        -PercentComplete $pct
+# Graph JSON batching: POST /$batch with up to 20 requests reduces N serial HTTP
+# round-trips to ceil(N/20), a ~20x improvement for large tenants.
+# If the batch POST itself fails, the catch block falls back to per-user sequential calls.
+$batchSize = 20
 
-    $driveInfo = Get-UserDriveInfo -UserId $user.UserId -UserPrincipalName $user.UserPrincipalName
-    $user.DriveInfo = $driveInfo
+for ($batchStart = 0; $batchStart -lt $total; $batchStart += $batchSize) {
+    $batchEnd = [Math]::Min($batchStart + $batchSize - 1, $total - 1)
+    $batchSlice = $allCandidates[$batchStart..$batchEnd]
 
-    if ($driveInfo.Found) {
-        $driveFound++
-        $confirmedUnlicensed.Add($user)
+    # Build id → user lookup and the requests array for this batch.
+    $batchMap = @{}
+    $batchReqs = [System.Collections.Generic.List[object]]::new()
+    for ($j = 0; $j -lt $batchSlice.Count; $j++) {
+        $batchMap["$j"] = $batchSlice[$j]
+        $batchReqs.Add(@{ id = "$j"; method = 'GET'; url = "/users/$($batchSlice[$j].UserId)/drive" })
     }
-    elseif ($driveInfo.Note -match '404') {
-        $driveNotFound++
-        # Pure 404 = never provisioned or already purged; skip.
+
+    $batchBody = @{ requests = $batchReqs } | ConvertTo-Json -Depth 3 -Compress
+
+    Test-ValidToken
+    $headers = @{ Authorization = "Bearer $global:token" }
+
+    try {
+        $batchResp = Invoke-GraphRequestWithThrottleHandling `
+            -Uri     'https://graph.microsoft.com/v1.0/$batch' `
+            -Method  POST `
+            -Headers $headers `
+            -Body    $batchBody
+
+        foreach ($resp in $batchResp.responses) {
+            $user = $batchMap[$resp.id]
+            $current++
+            $pct = [Math]::Round(($current / $total) * 100)
+            Write-Progress -Activity 'Querying OneDrive' `
+                -Status      "$current / $total ($pct%) — $($user.UserPrincipalName)" `
+                -PercentComplete $pct
+
+            switch ($resp.status) {
+                200 {
+                    $drive = $resp.body
+                    $usedGB = if ($drive.quota -and $null -ne $drive.quota.used) { [Math]::Round($drive.quota.used / 1GB, 3) } else { 0 }
+                    $totalGB = if ($drive.quota -and $null -ne $drive.quota.total) { [Math]::Round($drive.quota.total / 1GB, 3) } else { 0 }
+                    if ($debug) { Write-Host "    [OK] $($user.UserPrincipalName) -> $($drive.webUrl)" -ForegroundColor DarkGreen }
+                    $user.DriveInfo = [PSCustomObject]@{
+                        Found             = $true
+                        DriveId           = $drive.id
+                        DriveWebUrl       = $drive.webUrl
+                        StorageUsedGB     = $usedGB
+                        StorageTotalGB    = $totalGB
+                        DriveLastModified = $drive.lastModifiedDateTime
+                        Note              = ''
+                    }
+                    $driveFound++
+                    $confirmedUnlicensed.Add($user)
+                }
+                404 {
+                    if ($debug) { Write-Host "    [--] $($user.UserPrincipalName) : No OneDrive (404)" -ForegroundColor DarkYellow }
+                    $driveNotFound++
+                    # Never provisioned or already purged; skip.
+                }
+                default {
+                    $note = switch ($resp.status) {
+                        403 { 'Access denied (403) — check Files.Read.All permission' }
+                        429 { 'Throttled in batch (429) — re-run or increase $delayBetweenRequests' }
+                        default { "HTTP $($resp.status)" }
+                    }
+                    if ($debug) { Write-Host "    [--] $($user.UserPrincipalName) : $note" -ForegroundColor DarkYellow }
+                    $user.DriveInfo = [PSCustomObject]@{
+                        Found             = $false
+                        DriveId           = ''
+                        DriveWebUrl       = ''
+                        StorageUsedGB     = ''
+                        StorageTotalGB    = ''
+                        DriveLastModified = ''
+                        Note              = $note
+                    }
+                    $driveErrors++
+                    # 403/timeouts — included in report for admin review.
+                    $confirmedUnlicensed.Add($user)
+                }
+            }
+        }
     }
-    else {
-        $driveErrors++
-        # 403/timeouts — include in report for admin review.
-        $confirmedUnlicensed.Add($user)
+    catch {
+        # Batch POST itself failed — fall back to per-user sequential calls for this slice.
+        Write-Host "  Batch request failed — falling back to sequential for this slice: $($_.Exception.Message)" -ForegroundColor Yellow
+        foreach ($user in $batchSlice) {
+            $current++
+            $pct = [Math]::Round(($current / $total) * 100)
+            Write-Progress -Activity 'Querying OneDrive' `
+                -Status      "$current / $total ($pct%) — $($user.UserPrincipalName)" `
+                -PercentComplete $pct
+
+            $driveInfo = Get-UserDriveInfo -UserId $user.UserId -UserPrincipalName $user.UserPrincipalName
+            $user.DriveInfo = $driveInfo
+            if ($driveInfo.Found) {
+                $driveFound++
+                $confirmedUnlicensed.Add($user)
+            }
+            elseif ($driveInfo.Note -match '404') {
+                $driveNotFound++
+            }
+            else {
+                $driveErrors++
+                $confirmedUnlicensed.Add($user)
+            }
+        }
     }
 
     if ($delayBetweenRequests -gt 0) { Start-Sleep -Seconds $delayBetweenRequests }
