@@ -55,7 +55,6 @@
     - Added methods to clear memory and dispose of HTTP responses properly.
     Date Updated: 6/11/26: 
     - Added support for multi-geo scenarios
-    - Added support for deletion risk for ODB sites on retention if PAYG is disabled
     - Added download functionality for existing OneDrive Archive reports.
     - Merged the download functionality with the existing report generation.
 
@@ -182,26 +181,28 @@ $ReactivationCostPerGB = 0.60   # USD per GB one-time fee to reactivate an archi
 
 # ---- Email Notifications ----
 # Set $SendEmailNotifications = $true to send alert emails to admins after the report runs.
-# Two separate emails are sent when accounts fall within the configured day thresholds:
+# Three separate emails are sent when accounts fall within the configured day thresholds:
 #   (1) Approaching Read-Only  — when DaysUntilReadOnly  <= $DaysToNotifyBeforeReadOnly
 #   (2) Approaching Archive    — when DaysUntilArchive   <= $DaysToNotifyBeforeArchive
+#   (3) Approaching Deletion   — when DaysUntilDeletion  <= $DaysToNotifyBeforeDeletion
 $SendEmailNotifications = $false
 
 # Recipients — individual addresses or mail-enabled group/distribution-list addresses.
 $EmailTo = @(
-    'admin@M365CPI13246019.onmicrosoft.com'
-    'Test-Email-Security-Group@M365CPI13246019.onmicrosoft.com'
+    'admin@contoso.onmicrosoft.com'
+    'Test-Email-Security-Group@contoso.onmicrosoft.com'
 )
 
 # Sender address — must be a licensed Exchange Online mailbox in the tenant.
 # The app registration must have Mail.Send (Application) permission granted in Entra ID.
 # Email is sent via Graph API (POST /users/{EmailFrom}/sendMail) — no SMTP relay needed.
-$EmailFrom = 'admin@M365CPI13246019.onmicrosoft.com'
+$EmailFrom = 'admin@contoso.onmicrosoft.com'
 
 # Notification windows — an alert email is sent when a site's days-until-event falls
 # at or below this value. Set to 0 to only notify on the day of the event itself.
 $DaysToNotifyBeforeReadOnly = 14   # Notify admins this many days before a site goes read-only
 $DaysToNotifyBeforeArchive = 14   # Notify admins this many days before a site is archived
+$DaysToNotifyBeforeDeletion = 30   # Notify admins this many days before an archived site reaches deletion risk window
 
 ##############################################################
 #                END CONFIGURATION SECTION                   #
@@ -1651,27 +1652,57 @@ function Send-OneDriveAlertEmail {
     #>
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory)] [ValidateSet('ReadOnly', 'Archive')] [string]   $NotificationType,
+        [Parameter(Mandatory)] [ValidateSet('ReadOnly', 'Archive', 'Deletion')] [string]   $NotificationType,
         [Parameter(Mandatory)] [object[]]                            $AffectedAccounts,
         [Parameter(Mandatory)] [int]                                 $ThresholdDays
     )
 
     if ($AffectedAccounts.Count -eq 0) { return }
 
-    $thresholdLabel = if ($NotificationType -eq 'ReadOnly') { 'Read-Only' } else { 'Archive' }
-    $thresholdDay = if ($NotificationType -eq 'ReadOnly') { $script:ReadOnlyThresholdDays } else { $script:ArchiveThresholdDays }
+    $thresholdLabel = switch ($NotificationType) {
+        'ReadOnly' { 'Read-Only' }
+        'Archive' { 'Archive' }
+        'Deletion' { 'Deletion' }
+    }
+    $thresholdDay = switch ($NotificationType) {
+        'ReadOnly' { $script:ReadOnlyThresholdDays }
+        'Archive' { $script:ArchiveThresholdDays }
+        'Deletion' { $script:ArchiveDeletionThresholdDays }
+    }
 
     # --- Subject line ---
     $subject = "[OneDrive Alert] $($AffectedAccounts.Count) account(s) approaching $thresholdLabel within $ThresholdDays day(s) — Tenant: $script:tenantId"
 
     # --- Build HTML table rows, sorted by days remaining (most urgent first) ---
     $sortedAccounts = $AffectedAccounts | Sort-Object {
-        if ($NotificationType -eq 'ReadOnly') { $_.DaysUntilReadOnly } else { $_.DaysUntilArchive }
+        switch ($NotificationType) {
+            'ReadOnly' { $_.DaysUntilReadOnly }
+            'Archive' { $_.DaysUntilArchive }
+            'Deletion' { $_.DaysUntilDeletion }
+        }
     }
 
     $tableRows = foreach ($acct in $sortedAccounts) {
-        $daysRemaining = if ($NotificationType -eq 'ReadOnly') { $acct.DaysUntilReadOnly } else { $acct.DaysUntilArchive }
-        $targetDate = if ($NotificationType -eq 'ReadOnly') { $acct.ReadOnlyDate }      else { $acct.ArchiveDate }
+        $daysRemaining = switch ($NotificationType) {
+            'ReadOnly' { $acct.DaysUntilReadOnly }
+            'Archive' { $acct.DaysUntilArchive }
+            'Deletion' { $acct.DaysUntilDeletion }
+        }
+        $targetDate = switch ($NotificationType) {
+            'ReadOnly' { $acct.ReadOnlyDate }
+            'Archive' { $acct.ArchiveDate }
+            'Deletion' {
+                $deletionDateText = ''
+                if ($acct.UnlicensedDate) {
+                    try {
+                        $parsedUnlicensedDate = [datetime]::Parse($acct.UnlicensedDate)
+                        $deletionDateText = $parsedUnlicensedDate.AddDays($script:ArchiveDeletionThresholdDays).ToString('yyyy-MM-dd')
+                    }
+                    catch {}
+                }
+                $deletionDateText
+            }
+        }
         $storageText = if ($acct.StorageUsedGB -ne '') { "$($acct.StorageUsedGB) GB" } else { 'N/A' }
 
         # Row colour: red shading ≤ 3 days, amber ≤ 7 days, white otherwise
@@ -1692,12 +1723,15 @@ function Send-OneDriveAlertEmail {
         </tr>"
     }
 
-    $headerColor = if ($NotificationType -eq 'ReadOnly') { '#1a5276' } else { '#7b241c' }
-    $alertHeading = if ($NotificationType -eq 'ReadOnly') {
-        "OneDrive Read-Only Alert — $($AffectedAccounts.Count) account(s) go read-only within $ThresholdDays day(s)"
+    $headerColor = switch ($NotificationType) {
+        'ReadOnly' { '#1a5276' }
+        'Archive' { '#7b241c' }
+        'Deletion' { '#922b21' }
     }
-    else {
-        "OneDrive Archive Alert — $($AffectedAccounts.Count) account(s) will be archived within $ThresholdDays day(s)"
+    $alertHeading = switch ($NotificationType) {
+        'ReadOnly' { "OneDrive Read-Only Alert — $($AffectedAccounts.Count) account(s) go read-only within $ThresholdDays day(s)" }
+        'Archive' { "OneDrive Archive Alert — $($AffectedAccounts.Count) account(s) will be archived within $ThresholdDays day(s)" }
+        'Deletion' { "OneDrive Deletion Risk Alert — $($AffectedAccounts.Count) account(s) reach deletion risk window within $ThresholdDays day(s)" }
     }
 
     $body = @"
@@ -2045,7 +2079,18 @@ if ($IncludeDownloadedRowsInMainReport -and $global:spoDownloadedReportRows.Coun
             if (-not $match.UserPrincipalName -and $dl.UserPrincipalName) { $match.UserPrincipalName = $dl.UserPrincipalName; $changed = $true }
             if (-not $match.UnlicensedDate -and $dl.UnlicensedDate) { $match.UnlicensedDate = $dl.UnlicensedDate; $changed = $true }
             if ((-not $match.UnlicensedDueTo -or $match.UnlicensedDueTo -eq 'Unknown from SPO export') -and $dl.UnlicensedDueTo) { $match.UnlicensedDueTo = $dl.UnlicensedDueTo; $changed = $true }
-            if ((-not $match.DeletionBlockedBy) -and $dl.DeletionBlockedBy) { $match.DeletionBlockedBy = $dl.DeletionBlockedBy; $changed = $true }
+            if ($dl.DeletionBlockedBy) {
+                if ($match.PSObject.Properties['DeletionBlockedBy']) {
+                    if (-not $match.DeletionBlockedBy) {
+                        $match.DeletionBlockedBy = $dl.DeletionBlockedBy
+                        $changed = $true
+                    }
+                }
+                else {
+                    $match | Add-Member -NotePropertyName 'DeletionBlockedBy' -NotePropertyValue $dl.DeletionBlockedBy -Force
+                    $changed = $true
+                }
+            }
             if ($match.DriveInfo -and (-not $match.DriveInfo.DriveWebUrl) -and $dl.DriveInfo -and $dl.DriveInfo.DriveWebUrl) {
                 $match.DriveInfo.DriveWebUrl = $dl.DriveInfo.DriveWebUrl
                 $changed = $true
@@ -2137,6 +2182,16 @@ if ($SendEmailNotifications) {
                 $_.DaysUntilArchive -le $DaysToNotifyBeforeArchive
             })
 
+        # Deletion risk alert — archived accounts approaching deletion-risk threshold.
+        # Only numeric day counters are included; text values such as
+        # 'NA - PAYG Enabled' or 'Unknown - No Unlicensed Date' are excluded.
+        $deletionAlert = @($sorted | Where-Object {
+                $daysUntilDeletion = $_.DaysUntilDeletion -as [int]
+                $null -ne $daysUntilDeletion -and
+                $daysUntilDeletion -ge 0 -and
+                $daysUntilDeletion -le $DaysToNotifyBeforeDeletion
+            })
+
         if ($readOnlyAlert.Count -gt 0) {
             Write-Host "  Read-Only alert: $($readOnlyAlert.Count) account(s) within $DaysToNotifyBeforeReadOnly day(s) of read-only." -ForegroundColor Yellow
             Send-OneDriveAlertEmail -NotificationType ReadOnly -AffectedAccounts $readOnlyAlert -ThresholdDays $DaysToNotifyBeforeReadOnly
@@ -2151,6 +2206,14 @@ if ($SendEmailNotifications) {
         }
         else {
             Write-Host "  Archive alert  : No accounts within $DaysToNotifyBeforeArchive day(s) of archive — email skipped." -ForegroundColor Gray
+        }
+
+        if ($deletionAlert.Count -gt 0) {
+            Write-Host "  Deletion alert : $($deletionAlert.Count) account(s) within $DaysToNotifyBeforeDeletion day(s) of deletion risk." -ForegroundColor Yellow
+            Send-OneDriveAlertEmail -NotificationType Deletion -AffectedAccounts $deletionAlert -ThresholdDays $DaysToNotifyBeforeDeletion
+        }
+        else {
+            Write-Host "  Deletion alert : No accounts within $DaysToNotifyBeforeDeletion day(s) of deletion risk — email skipped." -ForegroundColor Gray
         }
     }
 }
