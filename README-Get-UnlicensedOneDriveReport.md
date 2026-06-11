@@ -167,6 +167,10 @@ Notes:
 - `DeletionBlockedBy` is typically populated for accounts sourced or backfilled from SPO download data.
 - For archived accounts without known unlicensed date, date-driven counters may remain unknown or use archive-specific status labels.
 
+Sample Output:
+
+<img width="3773" height="161" alt="image" src="https://github.com/user-attachments/assets/ec299b59-6a18-4357-b795-d89e570806e5" />
+
 ## Processing Flow
 
 1. Acquire Graph token.
