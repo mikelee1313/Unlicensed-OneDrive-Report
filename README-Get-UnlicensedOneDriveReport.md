@@ -175,6 +175,14 @@ Sample Output:
 
 <img width="1865" height="161" alt="image" src="https://github.com/user-attachments/assets/3308163e-707e-4bf9-a374-9cc30fec990e" />
 
+E-Mail Notifcation Samples:
+
+<img width="1249" height="261" alt="image" src="https://github.com/user-attachments/assets/f25bf2e0-4f98-49e2-8cc5-dd11f750276c" />
+
+<img width="1248" height="485" alt="image" src="https://github.com/user-attachments/assets/8ef6b545-7fd5-4e24-a7fe-40d55294aed3" />
+
+<img width="1252" height="474" alt="image" src="https://github.com/user-attachments/assets/26dfaa54-f460-42a7-8b24-bb2178b3f160" />
+
 
 ## Processing Flow
 
