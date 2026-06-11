@@ -53,6 +53,10 @@
     Date Updated: 5/1/26: 
     - Fixed performance issue in Get-LicenseChangeDates by doing a single bulk query instead of per-user queries. 
     - Added methods to clear memory and dispose of HTTP responses properly.
+    Date Updated: 6/11/26: 
+    - Added support for multi-geo scenarios
+    - Added download functionality for existing OneDrive Archive reports.
+    - Merged the download functionality with the existing report generation.
 
     Required Microsoft Graph App Permissions (Application type):
       User.Read.All           — Enumerate users and inspect assignedPlans/licenses
@@ -124,13 +128,37 @@ $includeLicenseRemovalDates = $true
 # How far back to search for license-change audit events (max 180 days).
 $AuditLogLookbackDays = 180
 
-# ---- Currently archived OneDrive sites (Sites API) ----
-# When $true: queries GET /sites/getAllSites to find personal OneDrive sites that
-# Microsoft has already archived. These are accounts whose Entra user was deleted
-# >30 days ago (purged from recycle bin) and whose OneDrive has since been archived.
-# Requires Sites.Read.All (Application) on the app registration.
-# When $false: only reports on active/soft-deleted populations (no Sites.Read.All needed).
-$GetCurrentlyArchived = $false
+# ---- Currently archived OneDrive accounts ----
+# Master switch. When $true, include currently archived OneDrive accounts.
+# When $false, only reports active/soft-deleted populations.
+$GetCurrentlyArchived = $true
+
+# Primary source for archived accounts:
+#   'SPODownload' (recommended): SharePoint Admin ExportToCSV download first.
+#   'GraphSites'               : Graph Sites API enumeration first.
+$ArchivedCollectionMode = 'SPODownload'
+
+# Only used when $ArchivedCollectionMode = 'SPODownload'.
+# If download fails or returns zero archived rows, optionally fall back to Graph Sites API.
+$FallbackToGraphSitesOnSPOFailure = $false
+
+# SharePoint Admin URLs used by the SPO export downloader (one per geo location).
+# Format: https://<tenant>-admin.sharepoint.com (no trailing slash)
+$SPOAdminUrls = @(
+    'https://m365cpi13246019-admin.sharepoint.com'
+)
+
+# Poll settings for SPO ExportToCSV download.
+$SPOExportPollIntervalSec = 5
+$SPOExportMaxWaitSec = 120
+
+# When $true, all downloaded SPO unlicensed reports (across admin URLs/geos)
+# are merged into a single CSV in $OutputFolder.
+$MergeDownloadedSPOReports = $true
+
+# When $true, rows from downloaded SPO reports are used to backfill/add records
+# in the final report (useful when audit lookup does not return dates or users).
+$IncludeDownloadedRowsInMainReport = $true
 
 # ---- Request throttling ----
 $MaxRetries = 15
@@ -180,6 +208,14 @@ $outputLog = Join-Path $OutputFolder "UnlicensedOneDrive_$date.csv"
 
 $global:token = $null
 $global:tokenExpiry = $null
+
+# SPO admin token cache, keyed by admin URL (different auth audience per geo).
+$global:spoTokenByAdminUrl = @{}
+# Tracks whether SPO export path failed so Phase 2b can log fallback reason once.
+$global:spoArchivedDownloadFailed = $false
+$global:spoDownloadedReportFiles = [System.Collections.Generic.List[string]]::new()
+$global:spoDownloadedReportRows = [System.Collections.Generic.List[object]]::new()
+$global:spoMergedDownloadReportPath = ''
 
 # Required for HTML-encoding display names and UPNs in alert email bodies
 Add-Type -AssemblyName System.Web
@@ -330,6 +366,35 @@ function ConvertTo-UPNFromSiteUrl {
     return $encodedPart
 }
 
+function Get-ObjectPropertyValue {
+    <#
+    .SYNOPSIS
+        Returns the first available property value from a candidate list.
+        Supports both exact and case-insensitive property-name lookups.
+    #>
+    param (
+        [Parameter(Mandatory)] [object]$InputObject,
+        [Parameter(Mandatory)] [string[]]$CandidateNames
+    )
+
+    foreach ($name in $CandidateNames) {
+        $normalizedCandidate = "$name".Trim().Trim([char]0xFEFF)
+
+        $prop = $InputObject.PSObject.Properties | Where-Object {
+            $_.Name -and $_.Name.ToString().Trim().Trim([char]0xFEFF) -ieq $normalizedCandidate
+        } | Select-Object -First 1
+
+        if ($prop) {
+            $value = $prop.Value
+            if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                return $value
+            }
+        }
+    }
+
+    return $null
+}
+
 #endregion Helper Functions
 
 #region Authentication Functions
@@ -427,6 +492,75 @@ function Test-ValidToken {
         Write-Host 'Token expired or expiring soon — refreshing...' -ForegroundColor Yellow
         AcquireToken
     }
+}
+
+function Get-SPOTokenForAdminUrl {
+    <#
+    .SYNOPSIS
+        Acquires or refreshes an SPO admin token for a specific admin URL.
+        Scope is <adminUrl>/.default, which is distinct per geo admin host.
+    #>
+    param (
+        [Parameter(Mandatory)] [string]$AdminUrl
+    )
+
+    $cached = $global:spoTokenByAdminUrl[$AdminUrl]
+    if ($cached -and $cached.expiry -and (Get-Date) -lt $cached.expiry) {
+        return $cached.access_token
+    }
+
+    $scope = "$AdminUrl/.default"
+    $tokenUri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+
+    if ($AuthType -eq 'ClientSecret') {
+        $body = @{
+            grant_type    = 'client_credentials'
+            client_id     = $clientId
+            client_secret = $clientSecret
+            scope         = $scope
+        }
+    }
+    elseif ($AuthType -eq 'Certificate') {
+        $cert = Get-Item -Path "Cert:\$CertStore\My\$Thumbprint" -ErrorAction Stop
+        $now = [System.DateTimeOffset]::UtcNow
+        $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+        $nbf = $now.ToUnixTimeSeconds()
+
+        $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_') } | ConvertTo-Json -Compress
+        $payload = @{ aud = $tokenUri; exp = $exp; iss = $clientId; jti = [System.Guid]::NewGuid().ToString(); nbf = $nbf; sub = $clientId } | ConvertTo-Json -Compress
+
+        $hB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        $pB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        $toSign = "$hB64.$pB64"
+        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+        if (-not $rsa) { throw "Unable to access RSA private key for certificate $Thumbprint." }
+        $sig = $rsa.SignData(
+            [System.Text.Encoding]::UTF8.GetBytes($toSign),
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $jwt = "$toSign.$([Convert]::ToBase64String($sig).TrimEnd('=').Replace('+', '-').Replace('/', '_'))"
+
+        $body = @{
+            client_id             = $clientId
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $jwt
+            scope                 = $scope
+            grant_type            = 'client_credentials'
+        }
+    }
+    else {
+        throw "Invalid AuthType '$AuthType'. Use 'Certificate' or 'ClientSecret'."
+    }
+
+    $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
+        -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
+
+    $expiresIn = if ($resp.expires_in) { [int]$resp.expires_in } else { 3600 }
+    $expiry = (Get-Date).AddSeconds($expiresIn - 300)
+    $global:spoTokenByAdminUrl[$AdminUrl] = @{ access_token = $resp.access_token; expiry = $expiry }
+
+    Write-Host "  SPO token acquired for $AdminUrl. Valid until: $expiry" -ForegroundColor Green
+    return $resp.access_token
 }
 
 #endregion Authentication Functions
@@ -913,6 +1047,388 @@ function Get-ArchivedOneDriveSites {
     return $archivedSites
 }
 
+function Download-UnlicensedOneDriveCsvFromSPO {
+    <#
+    .SYNOPSIS
+        Downloads the same unlicensed OneDrive CSV report exposed by
+        SharePoint Admin Center "Download report" for a given admin URL.
+    #>
+    param (
+        [Parameter(Mandatory)] [string]$AdminUrl,
+        [Parameter()]          [string]$OutputPath = $OutputFolder
+    )
+
+    $spoToken = Get-SPOTokenForAdminUrl -AdminUrl $AdminUrl
+
+    $contextHeaders = @{
+        Authorization = "Bearer $spoToken"
+        Accept        = 'application/json;odata=verbose'
+    }
+    $contextInfo = Invoke-GraphRequestWithThrottleHandling -Uri "$AdminUrl/_api/contextinfo" -Method POST -Headers $contextHeaders -ContentType 'application/json;odata=verbose'
+    $digest = $contextInfo.d.GetContextWebInformation.FormDigestValue
+
+    $viewXml = '<View><Query><Where><And><And>' +
+    '<And><And>' +
+    '<IsNotNull><FieldRef Name="UnlicensedOdbReason"/></IsNotNull>' +
+    '<Neq><FieldRef Name="UnlicensedOdbReason"/><Value Type=''Integer''>0</Value></Neq>' +
+    '</And>' +
+    '<IsNotNull><FieldRef Name="UnlicensedOdbCleanupBlockReason"/></IsNotNull>' +
+    '</And>' +
+    '<And>' +
+    '<Eq><FieldRef Name="TemplateId"/><Value Type=''Integer''>21</Value></Eq>' +
+    '<IsNull><FieldRef Name="TimeDeleted"/></IsNull>' +
+    '</And>' +
+    '</And>' +
+    '<And>' +
+    '<Neq><FieldRef Name=''TemplateName''/><Value Type=''Text''>TEAMCHANNEL#0</Value></Neq>' +
+    '<Neq><FieldRef Name=''TemplateName''/><Value Type=''Text''>TEAMCHANNEL#1</Value></Neq>' +
+    '</And></And></Where></Query>' +
+    '<ViewFields>' +
+    '<FieldRef Name="Title"/><FieldRef Name="SiteOwnerName"/><FieldRef Name="StorageUsed"/>' +
+    '<FieldRef Name="UnlicensedOdbReason"/><FieldRef Name="UnlicensedOdbStartDate"/>' +
+    '<FieldRef Name="UnlicensedOdbCleanupBlockReason"/><FieldRef Name="SiteOwnerEmail"/>' +
+    '<FieldRef Name="UnlicensedOdbToBeDeletedOn"/><FieldRef Name="ArchiveStatus"/>' +
+    '<FieldRef Name="UnlicensedOdbProvisionedForUPN"/><FieldRef Name="SiteUrl"/>' +
+    '</ViewFields></View>'
+
+    $columnsInfo = @(
+        @{ columnName = 'TITLE'; viewFieldName = 'Title' }
+        @{ columnName = 'PRIMARY_ADMIN'; viewFieldName = 'SiteOwnerName' }
+        @{ columnName = 'STORAGE_USED'; viewFieldName = 'StorageUsed' }
+        @{ columnName = 'UNLICENSED_REASON'; viewFieldName = 'UnlicensedOdbReason' }
+        @{ columnName = 'UNLICENSED_ON'; viewFieldName = 'UnlicensedOdbStartDate' }
+        @{ columnName = 'DELETION_BLOCK_REASON'; viewFieldName = 'UnlicensedOdbCleanupBlockReason' }
+        @{ columnName = 'SITE_OWNER_EMAIL'; viewFieldName = 'SiteOwnerEmail' }
+        @{ columnName = 'DELETION_SCHEDULED_ON'; viewFieldName = 'UnlicensedOdbToBeDeletedOn' }
+        @{ columnName = 'ARCHIVE_STATUS'; viewFieldName = 'ArchiveStatus' }
+        @{ columnName = 'ACCOUNT_PROVISIONED_FOR'; viewFieldName = 'UnlicensedOdbProvisionedForUPN' }
+        @{ columnName = 'URL'; viewFieldName = 'SiteUrl' }
+    )
+
+    $exportBody = [ordered]@{
+        viewXml     = $viewXml
+        columnsInfo = $columnsInfo
+        listName    = 'DO_NOT_DELETE_SPLIST_TENANTADMIN_ALL_SITES_AGGREGATED_SITECOLLECTIONS'
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    $postHeaders = @{
+        Authorization     = "Bearer $spoToken"
+        Accept            = 'application/json;odata.metadata=minimal'
+        'X-RequestDigest' = $digest
+        'odata-version'   = '4.0'
+    }
+
+    $exportResp = Invoke-GraphRequestWithThrottleHandling `
+        -Uri "$AdminUrl/_api/SPO.Tenant/ExportToCSV" `
+        -Method POST `
+        -Headers $postHeaders `
+        -Body $exportBody `
+        -ContentType 'application/json;charset=utf-8'
+
+    $relPath = $null
+    if ($exportResp.d -and $exportResp.d.ExportToCSV) {
+        $relPath = $exportResp.d.ExportToCSV
+    }
+    elseif ($exportResp.value) {
+        $relPath = $exportResp.value
+    }
+    if (-not $relPath) {
+        throw 'ExportToCSV did not return a file path.'
+    }
+
+    $relPath = $relPath.TrimStart('/')
+    $csvUrl = "$AdminUrl/$relPath"
+    $downloadHeaders = @{ Authorization = "Bearer $spoToken" }
+
+    $elapsed = 0
+    $ready = $false
+    while ($elapsed -lt $SPOExportMaxWaitSec) {
+        try {
+            Invoke-GraphRequestWithThrottleHandling -Uri $csvUrl -Method HEAD -Headers $downloadHeaders | Out-Null
+            $ready = $true
+            break
+        }
+        catch {
+            $sc = $null
+            if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
+            if ($sc -eq 404) {
+                Start-Sleep -Seconds $SPOExportPollIntervalSec
+                $elapsed += $SPOExportPollIntervalSec
+            }
+            else {
+                throw $_
+            }
+        }
+    }
+
+    if (-not $ready) {
+        throw "Report file was not available after ${SPOExportMaxWaitSec}s: $csvUrl"
+    }
+
+    if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+    $fileName = Split-Path $relPath -Leaf
+    $tenantLabel = if ($AdminUrl -match 'https://([^-]+)-admin\.sharepoint\.com') { $matches[1] } else { $AdminUrl -replace 'https?://' }
+    $localFile = Join-Path $OutputPath "UnlicensedOneDrive_${tenantLabel}_$fileName"
+
+    Invoke-WebRequest -Uri $csvUrl -Headers $downloadHeaders -OutFile $localFile -UseBasicParsing -ErrorAction Stop
+    Write-Host "  SPO report downloaded: $localFile" -ForegroundColor Green
+    return $localFile
+}
+
+function Convert-SPOCsvToArchivedSites {
+    <#
+    .SYNOPSIS
+        Converts downloaded SPO unlicensed OneDrive CSV rows into the report's
+        Archived account object model.
+    #>
+    param (
+        [Parameter(Mandatory)] [string]$CsvPath
+    )
+
+    $archivedSites = [System.Collections.Generic.List[object]]::new()
+    $rows = Import-Csv -Path $CsvPath
+
+    foreach ($row in $rows) {
+        $archiveStatusRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('ARCHIVE_STATUS', 'Archive status', 'ArchiveStatus')
+        $archiveStatus = if ($archiveStatusRaw) { "$archiveStatusRaw".Trim() } else { '' }
+        if (-not $archiveStatus) { continue }
+        if ($archiveStatus -ieq 'none') { continue }
+        if ($archiveStatus -in @('reactivating', 'unknownFutureValue')) { continue }
+
+        $upn = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('ACCOUNT_PROVISIONED_FOR', 'Account provisioned for (UPN)', 'UnlicensedOdbProvisionedForUPN', 'Owner email', 'SITE_OWNER_EMAIL')
+        $displayName = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('Display name', 'TITLE', 'Title', 'Username')
+        $url = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('URL', 'SiteUrl')
+        $storageUsedRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('STORAGE_USED', 'Storage used (GB)', 'StorageUsed')
+        $unlicensedReason = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('UNLICENSED_REASON', 'Unlicensed due to', 'UnlicensedOdbReason')
+
+        # Fallbacks: if CSV omitted UPN/display fields, derive from URL/email.
+        if (-not $upn -and $url) {
+            $upn = ConvertTo-UPNFromSiteUrl -SiteUrl "$url"
+        }
+        if (-not $displayName) {
+            if ($upn -and $upn.Contains('@')) {
+                $displayName = $upn.Split('@')[0]
+            }
+            elseif ($url) {
+                $displayName = ConvertTo-UPNFromSiteUrl -SiteUrl "$url"
+            }
+            else {
+                $displayName = 'Unknown Archived User'
+            }
+        }
+
+        $storageUsedGB = ''
+        if ($null -ne $storageUsedRaw -and "$storageUsedRaw".Trim() -ne '') {
+            try {
+                $storageUsedGB = [Math]::Round([double]("$storageUsedRaw"), 3)
+            }
+            catch {
+                $storageUsedGB = "$storageUsedRaw"
+            }
+        }
+
+        $note = if ($unlicensedReason) {
+            "archiveStatus: $archiveStatus | Source=SPO ExportToCSV | Reason: $unlicensedReason"
+        }
+        else {
+            "archiveStatus: $archiveStatus | Source=SPO ExportToCSV"
+        }
+
+        $archivedSites.Add([PSCustomObject]@{
+                UserId            = ''
+                UserPrincipalName = if ($upn) { "$upn" } else { '' }
+                DisplayName       = if ($displayName) { "$displayName" } else { '' }
+                AccountEnabled    = $false
+                HasAnyLicense     = $false
+                UserSource        = 'Archived'
+                UnlicensedDate    = $null
+                UnlicensedDueTo   = 'OneDrive archived by Microsoft'
+                ArchiveStatus     = "$archiveStatus"
+                DriveInfo         = [PSCustomObject]@{
+                    Found             = $true
+                    DriveId           = ''
+                    DriveWebUrl       = if ($url) { "$url" } else { '' }
+                    StorageUsedGB     = $storageUsedGB
+                    StorageTotalGB    = ''
+                    DriveLastModified = ''
+                    Note              = $note
+                }
+            })
+    }
+
+    return $archivedSites
+}
+
+function Convert-SPOCsvToReportAccounts {
+    <#
+    .SYNOPSIS
+        Converts downloaded SPO unlicensed OneDrive CSV rows into the script's
+        common account object shape (Active/SoftDeleted/Archived).
+    #>
+    param (
+        [Parameter(Mandatory)] [string]$CsvPath,
+        [Parameter(Mandatory)] [string]$AdminUrl
+    )
+
+    $accounts = [System.Collections.Generic.List[object]]::new()
+    $rows = Import-Csv -Path $CsvPath
+
+    foreach ($row in $rows) {
+        $archiveStatusRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('ARCHIVE_STATUS', 'Archive status', 'ArchiveStatus')
+        $archiveStatus = if ($archiveStatusRaw) { "$archiveStatusRaw".Trim() } else { '' }
+
+        $upn = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('ACCOUNT_PROVISIONED_FOR', 'Account provisioned for (UPN)', 'UnlicensedOdbProvisionedForUPN', 'Owner email', 'SITE_OWNER_EMAIL')
+        $displayName = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('Display name', 'TITLE', 'Title', 'Username')
+        $url = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('URL', 'SiteUrl')
+        $storageUsedRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('STORAGE_USED', 'Storage used (GB)', 'StorageUsed')
+        $unlicensedReason = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('UNLICENSED_REASON', 'Unlicensed due to', 'UnlicensedOdbReason')
+        $unlicensedOnRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('UNLICENSED_ON', 'Unlicensed on', 'UnlicensedOdbStartDate')
+
+        if (-not $upn -and $url) {
+            $upn = ConvertTo-UPNFromSiteUrl -SiteUrl "$url"
+        }
+        if (-not $displayName) {
+            if ($upn -and $upn.Contains('@')) {
+                $displayName = $upn.Split('@')[0]
+            }
+            elseif ($url) {
+                $displayName = ConvertTo-UPNFromSiteUrl -SiteUrl "$url"
+            }
+            else {
+                $displayName = 'Unknown User'
+            }
+        }
+
+        # If neither identity nor URL exists, ignore this row.
+        if (-not $upn -and -not $url) { continue }
+
+        $storageUsedGB = ''
+        if ($null -ne $storageUsedRaw -and "$storageUsedRaw".Trim() -ne '') {
+            try { $storageUsedGB = [Math]::Round([double]("$storageUsedRaw"), 3) } catch { $storageUsedGB = "$storageUsedRaw" }
+        }
+
+        $unlicensedDate = $null
+        if ($unlicensedOnRaw) {
+            try { $unlicensedDate = [datetime]::Parse("$unlicensedOnRaw") } catch {}
+        }
+
+        $userSource = 'Active'
+        $accountEnabled = $true
+        if ($archiveStatus -and $archiveStatus -notin @('None', 'none', 'reactivating', 'unknownFutureValue')) {
+            $userSource = 'Archived'
+            $accountEnabled = $false
+        }
+        elseif ($unlicensedReason -and "$unlicensedReason" -match 'Owner deleted from Entra ID') {
+            $userSource = 'SoftDeleted'
+            $accountEnabled = $false
+        }
+
+        $noteParts = [System.Collections.Generic.List[string]]::new()
+        if ($archiveStatus) { $noteParts.Add("archiveStatus: $archiveStatus") | Out-Null }
+        if ($unlicensedReason) { $noteParts.Add("Reason: $unlicensedReason") | Out-Null }
+        $noteParts.Add('Source=SPO ExportToCSV') | Out-Null
+        $noteParts.Add("AdminUrl=$AdminUrl") | Out-Null
+
+        $accounts.Add([PSCustomObject]@{
+                UserId            = ''
+                UserPrincipalName = if ($upn) { "$upn" } else { '' }
+                DisplayName       = if ($displayName) { "$displayName" } else { '' }
+                AccountEnabled    = $accountEnabled
+                HasAnyLicense     = $false
+                UserSource        = $userSource
+                UnlicensedDate    = $unlicensedDate
+                UnlicensedDueTo   = if ($unlicensedReason) { "$unlicensedReason" } else { 'Unknown from SPO export' }
+                ArchiveStatus     = "$archiveStatus"
+                DriveInfo         = [PSCustomObject]@{
+                    Found             = $true
+                    DriveId           = ''
+                    DriveWebUrl       = if ($url) { "$url" } else { '' }
+                    StorageUsedGB     = $storageUsedGB
+                    StorageTotalGB    = ''
+                    DriveLastModified = ''
+                    Note              = ($noteParts -join ' | ')
+                }
+            })
+    }
+
+    return $accounts
+}
+
+function Merge-SPODownloadedReports {
+    <#
+    .SYNOPSIS
+        Merges all downloaded SPO report rows from configured admin URLs into
+        a single CSV file for a concise tenant-wide multi-geo view.
+    #>
+    param (
+        [Parameter(Mandatory)] [object[]]$MergedRows
+    )
+
+    if ($MergedRows.Count -eq 0) { return '' }
+
+    if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+    $mergedPath = Join-Path $OutputFolder "UnlicensedOneDrive_SPO_Merged_$date.csv"
+    $MergedRows | Export-Csv -Path $mergedPath -NoTypeInformation -Encoding UTF8
+    Write-Host "  SPO merged download report written: $mergedPath" -ForegroundColor Green
+    return $mergedPath
+}
+
+function Get-ArchivedOneDriveSitesFromSPOExport {
+    <#
+    .SYNOPSIS
+        Fast-path collector for archived OneDrive accounts by downloading the
+        SharePoint Admin "Unlicensed OneDrive" CSV per configured admin URL.
+    #>
+    $fromCsv = [System.Collections.Generic.List[object]]::new()
+    $script:spoArchivedDownloadFailed = $false
+    $global:spoDownloadedReportFiles.Clear()
+    $global:spoDownloadedReportRows.Clear()
+    $global:spoMergedDownloadReportPath = ''
+
+    $mergedRawRows = [System.Collections.Generic.List[object]]::new()
+
+    if (-not $SPOAdminUrls -or $SPOAdminUrls.Count -eq 0) {
+        Write-Host '  SPO fast path skipped: no $SPOAdminUrls configured.' -ForegroundColor Gray
+        return $fromCsv
+    }
+
+    Write-Host "`nPhase 2b: Downloading archived candidates from SPO admin export..." -ForegroundColor Cyan
+    Write-Host "  Admin URLs configured: $($SPOAdminUrls.Count)" -ForegroundColor Gray
+
+    foreach ($adminUrl in $SPOAdminUrls) {
+        try {
+            Write-Host "  SPO export: $adminUrl" -ForegroundColor Gray
+            $csvPath = Download-UnlicensedOneDriveCsvFromSPO -AdminUrl $adminUrl -OutputPath $OutputFolder
+            $global:spoDownloadedReportFiles.Add($csvPath) | Out-Null
+
+            $rawRows = Import-Csv -Path $csvPath
+            foreach ($r in $rawRows) {
+                $r | Add-Member -NotePropertyName 'SourceAdminUrl' -NotePropertyValue $adminUrl -Force
+                $mergedRawRows.Add($r) | Out-Null
+            }
+
+            $parsedAll = Convert-SPOCsvToReportAccounts -CsvPath $csvPath -AdminUrl $adminUrl
+            foreach ($item in $parsedAll) { $global:spoDownloadedReportRows.Add($item) | Out-Null }
+
+            $parsedArchived = $parsedAll | Where-Object { $_.UserSource -eq 'Archived' }
+            foreach ($item in $parsedArchived) { $fromCsv.Add($item) }
+
+            Write-Host "    CSV rows: $($parsedAll.Count) | Archived rows: $($parsedArchived.Count)" -ForegroundColor Gray
+        }
+        catch {
+            $script:spoArchivedDownloadFailed = $true
+            Write-Host "    SPO export failed for $adminUrl : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    if ($MergeDownloadedSPOReports -and $mergedRawRows.Count -gt 0) {
+        $global:spoMergedDownloadReportPath = Merge-SPODownloadedReports -MergedRows $mergedRawRows
+    }
+
+    Write-Host "  SPO export path complete. Archived candidates: $($fromCsv.Count)" -ForegroundColor Green
+    return $fromCsv
+}
+
 #endregion Data Collection Functions
 
 #region Enrichment Functions
@@ -936,24 +1452,51 @@ function Add-MilestoneCalculations {
         $daysSinceUnlicensed = $null
         $daysUntilReadOnly = $null
         $daysUntilArchive = $null
+        $rawDaysUntilReadOnly = $null
+        $rawDaysUntilArchive = $null
         $urgencyStatus = 'Unknown - No Unlicensed Date'
 
         if ($unlicensedDate) {
             $readOnlyDate = $unlicensedDate.AddDays($script:ReadOnlyThresholdDays)
             $archiveDate = $unlicensedDate.AddDays($script:ArchiveThresholdDays)
             $daysSinceUnlicensed = ($script:today - $unlicensedDate.Date).Days
-            $daysUntilReadOnly = ($readOnlyDate.Date - $script:today).Days
-            $daysUntilArchive = ($archiveDate.Date - $script:today).Days
+            $rawDaysUntilReadOnly = ($readOnlyDate.Date - $script:today).Days
+            $rawDaysUntilArchive = ($archiveDate.Date - $script:today).Days
 
-            $urgencyStatus = switch ($true) {
-                ($daysUntilArchive -lt 0) { 'ARCHIVED - Past Day 93' }
-                ($daysUntilArchive -eq 0) { 'CRITICAL - Archives TODAY' }
-                ($daysUntilArchive -le 7) { 'CRITICAL - Archives within 7 days' }
-                ($daysUntilReadOnly -lt 0 -and $daysUntilArchive -gt 7) { 'WARNING - Read-Only, Archive pending' }
-                ($daysUntilReadOnly -eq 0) { 'WARNING - Goes Read-Only TODAY' }
-                ($daysUntilReadOnly -le 7) { 'WARNING - Read-Only within 7 days' }
-                ($daysUntilReadOnly -le 30) { 'MONITOR - Read-Only within 30 days' }
-                default { 'OK - More than 30 days remaining' }
+            # Clamp day counters for report readability while preserving raw values
+            # for urgency classification.
+            if ($rawDaysUntilArchive -lt 0) {
+                $daysUntilReadOnly = 'Already Archived'
+                $daysUntilArchive = 'Already Archived'
+            }
+            else {
+                $daysUntilReadOnly = [Math]::Max($rawDaysUntilReadOnly, 0)
+                $daysUntilArchive = [Math]::Max($rawDaysUntilArchive, 0)
+            }
+
+            if ($rawDaysUntilArchive -lt 0) {
+                $urgencyStatus = 'ARCHIVED - Past Day 93'
+            }
+            elseif ($rawDaysUntilArchive -eq 0) {
+                $urgencyStatus = 'CRITICAL - Archives TODAY'
+            }
+            elseif ($rawDaysUntilArchive -le 7) {
+                $urgencyStatus = 'CRITICAL - Archives within 7 days'
+            }
+            elseif ($rawDaysUntilReadOnly -lt 0 -and $rawDaysUntilArchive -gt 7) {
+                $urgencyStatus = 'WARNING - Read-Only, Archive pending'
+            }
+            elseif ($rawDaysUntilReadOnly -eq 0) {
+                $urgencyStatus = 'WARNING - Goes Read-Only TODAY'
+            }
+            elseif ($rawDaysUntilReadOnly -le 7) {
+                $urgencyStatus = 'WARNING - Read-Only within 7 days'
+            }
+            elseif ($rawDaysUntilReadOnly -le 30) {
+                $urgencyStatus = 'MONITOR - Read-Only within 30 days'
+            }
+            else {
+                $urgencyStatus = 'OK - More than 30 days remaining'
             }
         }
 
@@ -965,6 +1508,8 @@ function Add-MilestoneCalculations {
                 'recentlyArchived' { 'ARCHIVED - Recently Archived' }
                 default { 'ARCHIVED - Currently Archived' }
             }
+            $daysUntilReadOnly = 'Already Archived'
+            $daysUntilArchive = 'Already Archived'
         }
 
         $driveInfo = $acct.DriveInfo
@@ -981,7 +1526,7 @@ function Add-MilestoneCalculations {
         }
 
         if ($null -ne $storageGB) {
-            $projMonthlyStorageCost = [Math]::Round($storageGB * $script:ArchivalStorageCostPerGBMonth, 2)
+            $projMonthlyStorageCost = [Math]::Round($storageGB * $script:ArchivalStorageCostPerGBMonth, 4)
             $projReactivationCost = [Math]::Round($storageGB * $script:ReactivationCostPerGB, 2)
         }
 
@@ -1056,13 +1601,54 @@ function Write-ConsoleSummary {
         $totalProjReactivation = ($projectedWithCost | Measure-Object -Property ProjReactivationCost   -Sum).Sum
         Write-Host "`n  Projected Costs (@ Microsoft unlicensed OneDrive pricing):" -ForegroundColor White
         Write-Host "  Note: Archived accounts reflect active ongoing costs. Pre-archive accounts show projected costs if they reach Day 93." -ForegroundColor Gray
-        Write-Host ("    Monthly storage cost  (@`$0.05/GB/month) : `${0:N2} USD/month" -f $totalProjMonthly)      -ForegroundColor Yellow
+        Write-Host ("    Monthly storage cost  (@`$0.05/GB/month) : `${0:N4} USD/month" -f $totalProjMonthly)      -ForegroundColor Yellow
         Write-Host ("    Reactivation cost     (@`$0.60/GB)       : `${0:N2} USD one-time" -f $totalProjReactivation) -ForegroundColor Yellow
         Write-Host ("    Accounts with storage data: {0} of {1} total" -f $projectedWithCost.Count, $Records.Count) -ForegroundColor Gray
     }
     else {
         Write-Host "`n  Projected Costs: No accounts with storage data available for cost estimation." -ForegroundColor Gray
     }
+}
+
+function Remove-IntermediateOutputFiles {
+    <#
+    .SYNOPSIS
+        Deletes intermediate downloaded/merged SPO CSV files created during this run,
+        keeping only the main output report file.
+    #>
+    param (
+        [Parameter(Mandatory)] [string]$MainReportPath
+    )
+
+    $filesToDelete = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($f in $global:spoDownloadedReportFiles) {
+        if ($f) { $filesToDelete.Add([string]$f) | Out-Null }
+    }
+
+    if ($global:spoMergedDownloadReportPath) {
+        $filesToDelete.Add([string]$global:spoMergedDownloadReportPath) | Out-Null
+    }
+
+    # Never delete the primary report.
+    if ($MainReportPath) {
+        $filesToDelete.Remove([string]$MainReportPath) | Out-Null
+    }
+
+    $deletedCount = 0
+    foreach ($filePath in $filesToDelete) {
+        try {
+            if (Test-Path -LiteralPath $filePath) {
+                Remove-Item -LiteralPath $filePath -Force -ErrorAction Stop
+                $deletedCount++
+            }
+        }
+        catch {
+            Write-Host "  Cleanup warning: could not delete $filePath : $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "  Intermediate files removed: $deletedCount" -ForegroundColor Gray
 }
 
 #endregion Output Functions
@@ -1254,7 +1840,34 @@ if ($allCandidates.Count -eq 0 -and -not $GetCurrentlyArchived) {
 # via GET /sites/{siteId}/drive, so Phase 4 does not process these.
 $archivedSites = [System.Collections.Generic.List[object]]::new()
 if ($GetCurrentlyArchived) {
-    $rawArchivedSites = Get-ArchivedOneDriveSites
+    $rawArchivedSites = [System.Collections.Generic.List[object]]::new()
+
+    switch ($ArchivedCollectionMode) {
+        'SPODownload' {
+            $rawArchivedSites = Get-ArchivedOneDriveSitesFromSPOExport
+
+            if ($rawArchivedSites.Count -eq 0) {
+                if ($FallbackToGraphSitesOnSPOFailure) {
+                    $fallbackReason = if ($script:spoArchivedDownloadFailed) { 'SPO export failed for one or more admin URLs' } else { 'SPO export returned no archived rows' }
+                    Write-Host "  Phase 2b fallback: Graph Sites API ($fallbackReason)." -ForegroundColor Yellow
+                    $rawArchivedSites = Get-ArchivedOneDriveSites
+                }
+                else {
+                    Write-Host '  Phase 2b: SPO export returned no archived rows; Graph fallback disabled.' -ForegroundColor Gray
+                }
+            }
+        }
+        'GraphSites' {
+            $rawArchivedSites = Get-ArchivedOneDriveSites
+        }
+        default {
+            Write-Host "  Invalid ArchivedCollectionMode '$ArchivedCollectionMode'. Using 'SPODownload'." -ForegroundColor Yellow
+            $rawArchivedSites = Get-ArchivedOneDriveSitesFromSPOExport
+            if ($rawArchivedSites.Count -eq 0 -and $FallbackToGraphSitesOnSPOFailure) {
+                $rawArchivedSites = Get-ArchivedOneDriveSites
+            }
+        }
+    }
 
     # Deduplicate: if a UPN from the Sites API already exists in $allCandidates (e.g., a user
     # soft-deleted within the 30-day window also shows up in getAllSites), keep the Entra record.
@@ -1433,6 +2046,55 @@ if ($archivedSites.Count -gt 0) {
     Write-Host "  Archived sites merged (Phase 2b): $($archivedSites.Count)" -ForegroundColor Green
 }
 
+# Step 6b: Backfill/add accounts from downloaded SPO reports.
+# This helps include records that may not be found via audit lookup or candidate enumeration.
+if ($IncludeDownloadedRowsInMainReport -and $global:spoDownloadedReportRows.Count -gt 0) {
+    $addedFromDownload = 0
+    $updatedFromDownload = 0
+
+    foreach ($dl in $global:spoDownloadedReportRows) {
+        $match = $null
+
+        if ($dl.UserPrincipalName) {
+            $match = $confirmedUnlicensed | Where-Object {
+                $_.UserPrincipalName -and $_.UserPrincipalName.Equals($dl.UserPrincipalName, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+        }
+
+        if (-not $match -and $dl.DriveInfo -and $dl.DriveInfo.DriveWebUrl) {
+            $match = $confirmedUnlicensed | Where-Object {
+                $_.DriveInfo -and $_.DriveInfo.DriveWebUrl -and $_.DriveInfo.DriveWebUrl.Equals($dl.DriveInfo.DriveWebUrl, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+        }
+
+        if ($match) {
+            $changed = $false
+            if (-not $match.DisplayName -and $dl.DisplayName) { $match.DisplayName = $dl.DisplayName; $changed = $true }
+            if (-not $match.UserPrincipalName -and $dl.UserPrincipalName) { $match.UserPrincipalName = $dl.UserPrincipalName; $changed = $true }
+            if (-not $match.UnlicensedDate -and $dl.UnlicensedDate) { $match.UnlicensedDate = $dl.UnlicensedDate; $changed = $true }
+            if ((-not $match.UnlicensedDueTo -or $match.UnlicensedDueTo -eq 'Unknown from SPO export') -and $dl.UnlicensedDueTo) { $match.UnlicensedDueTo = $dl.UnlicensedDueTo; $changed = $true }
+            if ($match.DriveInfo -and (-not $match.DriveInfo.DriveWebUrl) -and $dl.DriveInfo -and $dl.DriveInfo.DriveWebUrl) {
+                $match.DriveInfo.DriveWebUrl = $dl.DriveInfo.DriveWebUrl
+                $changed = $true
+            }
+            if ($match.DriveInfo -and (($match.DriveInfo.StorageUsedGB -eq '' -or $null -eq $match.DriveInfo.StorageUsedGB) -and $dl.DriveInfo -and $dl.DriveInfo.StorageUsedGB -ne '')) {
+                $match.DriveInfo.StorageUsedGB = $dl.DriveInfo.StorageUsedGB
+                $changed = $true
+            }
+            if ($changed) { $updatedFromDownload++ }
+            continue
+        }
+
+        $confirmedUnlicensed.Add($dl)
+        $addedFromDownload++
+    }
+
+    Write-Host "  SPO download backfill: added $addedFromDownload | updated $updatedFromDownload" -ForegroundColor Green
+    if ($global:spoMergedDownloadReportPath) {
+        Write-Host "  SPO merged source file: $($global:spoMergedDownloadReportPath)" -ForegroundColor Gray
+    }
+}
+
 # Step 7 (Phase 5): Enrich with Day-$ReadOnlyThresholdDays / Day-$ArchiveThresholdDays milestones
 Write-Host "`nPhase 5: Calculating Day-$ReadOnlyThresholdDays / Day-$ArchiveThresholdDays milestones..." -ForegroundColor Cyan
 $enriched = if ($confirmedUnlicensed.Count -gt 0) {
@@ -1463,6 +2125,9 @@ if ($sorted.Count -gt 0) {
     Write-Host "  Report written: $outputLog" -ForegroundColor Green
     Write-Host "  Total records : $($sorted.Count)" -ForegroundColor Green
     Write-Host '======================================================' -ForegroundColor Cyan
+
+    # Keep only the main report output from this run.
+    Remove-IntermediateOutputFiles -MainReportPath $outputLog
 }
 else {
     Write-Host "`nNo unlicensed OneDrive accounts with active drives found." -ForegroundColor Green
