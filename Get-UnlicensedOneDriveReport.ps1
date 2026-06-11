@@ -55,6 +55,7 @@
     - Added methods to clear memory and dispose of HTTP responses properly.
     Date Updated: 6/11/26: 
     - Added support for multi-geo scenarios
+    - Added support for deletion risk for ODB sites on retention if PAYG is disabled
     - Added download functionality for existing OneDrive Archive reports.
     - Merged the download functionality with the existing report generation.
 
