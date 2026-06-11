@@ -167,7 +167,7 @@ Notes:
 - `DeletionBlockedBy` is typically populated for accounts sourced or backfilled from SPO download data.
 - For archived accounts without known unlicensed date, date-driven counters may remain unknown or use archive-specific status labels.
 
-Sample Output:
+## Sample Output:
 
 <img width="1608" height="158" alt="image" src="https://github.com/user-attachments/assets/67d289fd-c2e9-40f4-86af-1c39dc48ac38" />
 
@@ -175,7 +175,8 @@ Sample Output:
 
 <img width="1865" height="161" alt="image" src="https://github.com/user-attachments/assets/3308163e-707e-4bf9-a374-9cc30fec990e" />
 
-E-Mail Notifcation Samples:
+
+## E-Mail Notifcation Samples:
 
 <img width="1249" height="261" alt="image" src="https://github.com/user-attachments/assets/f25bf2e0-4f98-49e2-8cc5-dd11f750276c" />
 
