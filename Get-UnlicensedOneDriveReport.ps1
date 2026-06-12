@@ -69,6 +69,9 @@
       Mail.Send               — [OPTIONAL] Send alert emails via Graph API (POST /users/{sender}/sendMail)
                                  Set $SendEmailNotifications = $false to skip.
                                  The $EmailFrom mailbox must be a licensed Exchange Online mailbox.
+    
+    Required SharePoint  Permissions (Application type):
+    Sites.FullControl.All  - Required to Download OneDrive Reports from the Admin API 
 
     A SINGLE app registration in the HOME TENANT covers all geo locations.
     No per-geo tokens required — Graph handles multi-geo routing automatically.
