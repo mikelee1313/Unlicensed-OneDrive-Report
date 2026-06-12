@@ -99,7 +99,7 @@
 ##############################################################
 
 # ---- Debug output ----
-$debug = $false
+$debug = $true
 
 # ---- Tenant & App Registration ----
 # A SINGLE registration in the home (NAM) tenant covers all geo locations.
@@ -192,7 +192,7 @@ $SendEmailNotifications = $false
 
 # Recipients — individual addresses or mail-enabled group/distribution-list addresses.
 $EmailTo = @(
-    'admin@contoso.onmicrosoft.com',
+    'admin@contoso.onmicrosoft.com'
     'Test-Email-Security-Group@contoso.onmicrosoft.com'
 )
 
@@ -321,13 +321,25 @@ function Invoke-GraphRequestWithThrottleHandling {
             }
 
             $waitSec = $backoffSec
-            if ($statusCode -eq 429) {
-                try {
-                    $ra = $_.Exception.Response.Headers['Retry-After']
-                    if ($ra) { $waitSec = [int]$ra }
+            try {
+                if ($_.Exception.Response -and $_.Exception.Response.Headers) {
+                    $retryAfterSec = $_.Exception.Response.Headers['Retry-After']
+                    $parsedRetryAfterSec = 0
+                    if ($retryAfterSec -and [int]::TryParse([string]$retryAfterSec, [ref]$parsedRetryAfterSec) -and $parsedRetryAfterSec -gt 0) {
+                        $waitSec = $parsedRetryAfterSec
+                    }
+                    else {
+                        $retryAfterMs = $_.Exception.Response.Headers['x-ms-retry-after-ms']
+                        if ($retryAfterMs) {
+                            $parsedRetryAfterMs = 0
+                            if ([int]::TryParse([string]$retryAfterMs, [ref]$parsedRetryAfterMs) -and $parsedRetryAfterMs -gt 0) {
+                                $waitSec = [Math]::Ceiling($parsedRetryAfterMs / 1000.0)
+                            }
+                        }
+                    }
                 }
-                catch {}
             }
+            catch {}
 
             $retryCount++
             Write-Host "    Throttled ($statusCode). Waiting ${waitSec}s (attempt $retryCount/$MaxRetries)..." -ForegroundColor Yellow
@@ -729,9 +741,8 @@ function Get-SoftDeletedUsers {
 function Get-LicenseChangeDates {
     <#
     .SYNOPSIS
-        Single bulk query of directoryAudits for 'Change user license' and
-        'Remove user from licensed group' events. Returns userId -> most-recent-event-date
-        lookup table. Requires AuditLog.Read.All.
+        Single bulk query of directoryAudits for license-removal events. Returns
+        userId -> most-recent-event-date lookup table. Requires AuditLog.Read.All.
     #>
     param (
         [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$TargetUserIds
@@ -743,29 +754,125 @@ function Get-LicenseChangeDates {
     $lookupTable = [System.Collections.Generic.Dictionary[string, datetime]]::new()
     $cutoffDate = (Get-Date).AddDays(-$AuditLogLookbackDays)
     $cutoffDateUtc = $cutoffDate.ToUniversalTime().ToString('o')
+    # This tenant rejects date-bounded directoryAudits filters with HTTP 400.
+    # Use fallback scan mode by default and apply the lookback cutoff client-side.
+    $supportsServerSideDateFilter = $false
+
+    function Get-RecentTargetUserAuditActivityHints {
+        param (
+            [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$UserIds,
+            [Parameter(Mandatory)] [datetime]$SinceDate
+        )
+
+        $hintUri = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$select=activityDateTime,activityDisplayName,targetResources&`$orderby=activityDateTime desc&`$top=200"
+        $matchedActivityNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $matchedEvents = 0
+        $nextUri = $hintUri
+
+        try {
+            do {
+                Test-ValidToken
+                $headers = @{ Authorization = "Bearer $global:token" }
+                $response = Invoke-GraphRequestWithThrottleHandling -Uri $nextUri -Method GET -Headers $headers
+                $pageNewestEventDate = $null
+
+                foreach ($auditEvent in $response.value) {
+                    $eventDate = $null
+                    try { $eventDate = [datetime]::Parse($auditEvent.activityDateTime) } catch { continue }
+                    if (-not $pageNewestEventDate -or $eventDate -gt $pageNewestEventDate) {
+                        $pageNewestEventDate = $eventDate
+                    }
+                    if ($eventDate -lt $SinceDate) { continue }
+
+                    foreach ($target in $auditEvent.targetResources) {
+                        if (-not $target.id) { continue }
+                        if (-not $UserIds.Contains($target.id)) { continue }
+                        $matchedEvents++
+                        if ($auditEvent.activityDisplayName) {
+                            $matchedActivityNames.Add([string]$auditEvent.activityDisplayName) | Out-Null
+                        }
+                        break
+                    }
+                }
+
+                $nextUri = $response.'@odata.nextLink'
+                if ($pageNewestEventDate -and $pageNewestEventDate -lt $SinceDate) {
+                    $nextUri = $null
+                }
+            } while ($nextUri)
+        }
+        catch {
+            if ($debug) {
+                Write-Host "  [DEBUG] Audit hint scan failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
+            return
+        }
+
+        if ($matchedEvents -gt 0) {
+            $activityList = @($matchedActivityNames | Sort-Object)
+            Write-Host "  Diagnostic: found $matchedEvents recent audit event(s) for target users outside the current activity-name filters." -ForegroundColor Yellow
+            Write-Host ("  Diagnostic activity names: {0}" -f ($activityList -join '; ')) -ForegroundColor Yellow
+        }
+        else {
+            Write-Host '  Diagnostic: no recent directoryAudit events were found for the target users within the lookback window.' -ForegroundColor Yellow
+        }
+    }
+
+    function Test-HasLicenseRelatedModifiedProperty {
+        param (
+            [Parameter(Mandatory)] [object]$TargetResource
+        )
+
+        foreach ($modifiedProperty in $TargetResource.modifiedProperties) {
+            if (-not $modifiedProperty.displayName) { continue }
+            $propertyName = [string]$modifiedProperty.displayName
+            if ($propertyName -match 'assignedlicenses|assignedplans|license|serviceplan') {
+                return $true
+            }
+        }
+
+        return $false
+    }
 
     # directoryAudits does not support 'or' on activityDisplayName in a single $filter.
     # Prefer a server-side activityDateTime filter to cut request volume, then fall back
     # to client-side cutoff logic if the tenant rejects the combined filter/orderby.
-    $activityNames = @('Change user license', 'Remove user from licensed group')
+    # Include both direct user-license changes and the documented group-based license
+    # completion event that can target the affected user. Some tenants log license
+    # removal as 'Update user', so treat that as a match only when license-related
+    # properties were modified on the target user resource.
+    $activityFilters = @(
+        @{ Name = 'Change user license'; RequiresLicensePropertyMatch = $false; UseSlimSelect = $true },
+        @{ Name = 'Finish applying group based license to user'; RequiresLicensePropertyMatch = $false; UseSlimSelect = $true },
+        @{ Name = 'Remove user from licensed group'; RequiresLicensePropertyMatch = $false; UseSlimSelect = $true },
+        @{ Name = 'Update user'; RequiresLicensePropertyMatch = $true; UseSlimSelect = $false }
+    )
     $eventCount = 0
     $queryFailed = $false
 
-    foreach ($activityName in $activityNames) {
+    foreach ($activityFilter in $activityFilters) {
+        $activityName = $activityFilter.Name
         $filterWithDate = [Uri]::EscapeDataString("activityDisplayName eq '$activityName' and activityDateTime ge $cutoffDateUtc")
         $filterWithoutDate = [Uri]::EscapeDataString("activityDisplayName eq '$activityName'")
-        $queryModes = @(
-            @{
+        $querySuffix = if ($activityFilter.UseSlimSelect) {
+            "&`$select=activityDateTime,targetResources&`$orderby=activityDateTime desc&`$top=500"
+        }
+        else {
+            "&`$orderby=activityDateTime desc&`$top=500"
+        }
+        $queryModes = @()
+        if ($supportsServerSideDateFilter) {
+            $queryModes += @{
                 Name            = 'server-side date filter'
-                Uri             = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$filterWithDate&`$select=activityDateTime,targetResources&`$orderby=activityDateTime desc&`$top=500"
+                Uri             = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$filterWithDate$querySuffix"
                 AllowsEarlyStop = $false
-            },
-            @{
-                Name            = 'fallback scan'
-                Uri             = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$filterWithoutDate&`$select=activityDateTime,targetResources&`$orderby=activityDateTime desc&`$top=500"
-                AllowsEarlyStop = $true
             }
-        )
+        }
+        $queryModes += @{
+            Name            = 'fallback scan'
+            Uri             = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$filterWithoutDate$querySuffix"
+            AllowsEarlyStop = $true
+        }
         $completedActivity = $false
 
         foreach ($queryMode in $queryModes) {
@@ -786,7 +893,8 @@ function Get-LicenseChangeDates {
                     }
 
                     if ($statusCode -eq 400 -and $queryMode.Name -eq 'server-side date filter') {
-                        Write-Host "  '$activityName' rejected the date-bounded filter. Retrying with fallback scan..." -ForegroundColor Yellow
+                        $supportsServerSideDateFilter = $false
+                        Write-Host "  Tenant rejected the date-bounded audit filter. Using fallback scan for the remaining Phase 3 queries..." -ForegroundColor Yellow
                         $shouldTryNextMode = $true
                         break
                     }
@@ -811,6 +919,9 @@ function Get-LicenseChangeDates {
                     foreach ($target in $auditEvent.targetResources) {
                         if (-not $target.id) { continue }
                         if (-not $TargetUserIds.Contains($target.id)) { continue }
+                        if ($activityFilter.RequiresLicensePropertyMatch -and -not (Test-HasLicenseRelatedModifiedProperty -TargetResource $target)) {
+                            continue
+                        }
                         if (-not $lookupTable.ContainsKey($target.id) -or $eventDate -gt $lookupTable[$target.id]) {
                             $lookupTable[$target.id] = $eventDate
                         }
@@ -841,7 +952,11 @@ function Get-LicenseChangeDates {
     $missing = $TargetUserIds.Count - $lookupTable.Count
     Write-Host "  Audit scan complete. License removal dates found for $($lookupTable.Count) / $($TargetUserIds.Count) users." -ForegroundColor Green
     if ($missing -gt 0) {
-        Write-Host ("  {0} users have no audit event within {1} days. UnlicensedDate will show 'Unknown'." -f $missing, $AuditLogLookbackDays) -ForegroundColor Yellow
+        Write-Host ("  {0} users have no matching retained audit event within {1} days. UnlicensedDate will show 'Unknown'." -f $missing, $AuditLogLookbackDays) -ForegroundColor Yellow
+        Write-Host '  Causes can include: audit retention shorter than the lookback window, older license removals, or group-based changes logged under different activities.' -ForegroundColor Yellow
+        if ($lookupTable.Count -eq 0) {
+            Get-RecentTargetUserAuditActivityHints -UserIds $TargetUserIds -SinceDate $cutoffDate
+        }
     }
     return $lookupTable
 }
