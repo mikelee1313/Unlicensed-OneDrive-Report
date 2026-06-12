@@ -65,8 +65,9 @@
       User.Read.All           — Enumerate users and inspect assignedPlans/licenses
       Directory.Read.All      — Read soft-deleted users from Entra recycle bin
       Files.Read.All          — Read OneDrive drive metadata for any user
-      AuditLog.Read.All       — [OPTIONAL] directoryAudits for license-change dates
-                                 Set $includeLicenseRemovalDates = $false to skip.
+      AuditLog.Read.All       — Read directoryAudits for license-change dates
+                                 Set $includeLicenseRemovalDates = $false to skip
+    AuditLogsQuery.Read.All -   Query audit logs for additional information
       Sites.Read.All          — [OPTIONAL] GET /sites/getAllSites for currently archived OneDrive sites
                                  Set $GetCurrentlyArchived = $false to skip.
       Mail.Send               — [OPTIONAL] Send alert emails via Graph API (POST /users/{sender}/sendMail)
@@ -106,17 +107,12 @@ $debug = $false
 $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3'
 $clientId = 'abc64618-283f-47ba-a185-50d935d51d57'
 
-# ---- Authentication type: 'Certificate' or 'ClientSecret' ----
-$AuthType = 'Certificate'
-
-# Certificate thumbprint (used when $AuthType = 'Certificate')
+# ---- Authentication: Certificate only ----
+# Certificate thumbprint (must be installed in the certificate store)
 $Thumbprint = 'B696FDCFE1453F3FBC6031F54DE988DA0ED905A9'
 
 # Certificate store: 'LocalMachine' or 'CurrentUser'
 $CertStore = 'LocalMachine'
-
-# Client Secret (used when $AuthType = 'ClientSecret')
-$clientSecret = ''
 
 # ---- Report output ----
 $OutputFolder = $env:TEMP
@@ -150,8 +146,8 @@ $AuditLogLookbackDays = 180
 $GetCurrentlyArchived = $true
 
 # Primary source for archived accounts:
-#   'SPODownload' (recommended): SharePoint Admin ExportToCSV download first.
-#   'GraphSites'               : Graph Sites API enumeration first.
+#   'SPODownload' (recommended): SharePoint Admin ExportToCSV download.
+#   NOTE: Requires Certificate authentication. ClientSecret is not supported.
 $ArchivedCollectionMode = 'SPODownload'
 
 # SharePoint Admin URLs used by the SPO export downloader (one per geo location).
@@ -432,87 +428,99 @@ function Get-TenantPayGStatus {
 function AcquireToken {
     <#
     .SYNOPSIS
-        Acquires a Microsoft Graph access token (scope: graph.microsoft.com/.default).
-        One token covers all Graph endpoints across all geo datacenters.
+        Acquires a Microsoft Graph access token using Certificate authentication.
+        Scope: graph.microsoft.com/.default covers all Graph endpoints across all geo datacenters.
     #>
-    Write-Host "Authenticating to Microsoft Graph ($AuthType)..." -ForegroundColor Cyan
+    Write-Host "Authenticating to Microsoft Graph (Certificate)..." -ForegroundColor Cyan
 
     $scope = 'https://graph.microsoft.com/.default'
     $tokenUri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
 
-    if ($AuthType -eq 'ClientSecret') {
-        $body = @{
-            grant_type    = 'client_credentials'
-            client_id     = $clientId
-            client_secret = $clientSecret
-            scope         = $scope
-        }
-        try {
-            $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-                -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
-            $global:token = $resp.access_token
-            $expiresIn = if ($resp.expires_in) { $resp.expires_in } else { 3600 }
-            $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)
-            Write-Host "  Connected via Client Secret. Token valid until: $($global:tokenExpiry)" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "  Authentication failed (ClientSecret): $($_.Exception.Message)" -ForegroundColor Red
-            Exit
-        }
+    try {
+        $cert = Get-Item -Path "Cert:\$CertStore\My\$Thumbprint" -ErrorAction Stop
     }
-    elseif ($AuthType -eq 'Certificate') {
-        try {
-            $cert = Get-Item -Path "Cert:\$CertStore\My\$Thumbprint" -ErrorAction Stop
-        }
-        catch {
-            Write-Host "  Certificate $Thumbprint not found in $CertStore\My store." -ForegroundColor Red
-            Exit
-        }
-
-        $now = [System.DateTimeOffset]::UtcNow
-        $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
-        $nbf = $now.ToUnixTimeSeconds()
-
-        $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_') } | ConvertTo-Json -Compress
-        $payload = @{ aud = $tokenUri; exp = $exp; iss = $clientId; jti = [System.Guid]::NewGuid().ToString(); nbf = $nbf; sub = $clientId } | ConvertTo-Json -Compress
-
-        $hB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        $pB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        $toSign = "$hB64.$pB64"
-        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-        if (-not $rsa) {
-            Write-Host "  Unable to access RSA private key for certificate $Thumbprint." -ForegroundColor Red
-            Exit
-        }
-        $sig = $rsa.SignData(
-            [System.Text.Encoding]::UTF8.GetBytes($toSign),
-            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-        $jwt = "$toSign.$([Convert]::ToBase64String($sig).TrimEnd('=').Replace('+', '-').Replace('/', '_'))"
-
-        $body = @{
-            client_id             = $clientId
-            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
-            client_assertion      = $jwt
-            scope                 = $scope
-            grant_type            = 'client_credentials'
-        }
-
-        try {
-            $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-                -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
-            $global:token = $resp.access_token
-            $expiresIn = if ($resp.expires_in) { $resp.expires_in } else { 3600 }
-            $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)
-            Write-Host "  Connected via Certificate. Token valid until: $($global:tokenExpiry)" -ForegroundColor Green
-        }
-        catch {
-            Write-Host "  Authentication failed (Certificate): $($_.Exception.Message)" -ForegroundColor Red
-            Exit
-        }
+    catch {
+        Write-Host "  Certificate $Thumbprint not found in $CertStore\My store." -ForegroundColor Red
+        Write-Host "  Verify: (1) Thumbprint is correct (2) Cert exists in Cert:\$CertStore\My (3) Current process can access it" -ForegroundColor Yellow
+        Exit
     }
-    else {
-        Write-Host "  Invalid AuthType '$AuthType'. Use 'Certificate' or 'ClientSecret'." -ForegroundColor Red
+
+    # Validate certificate has private key and is not expired
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    if (-not $rsa) {
+        Write-Host "  Certificate $Thumbprint found, but cannot access its RSA private key." -ForegroundColor Red
+        Write-Host "  Causes: (1) Certificate has no private key (2) Process lacks permissions to read private key (3) Certificate format unsupported" -ForegroundColor Yellow
+        Exit
+    }
+
+    if ($cert.NotAfter -lt (Get-Date)) {
+        Write-Host "  Certificate $Thumbprint has expired on $($cert.NotAfter)." -ForegroundColor Red
+        Exit
+    }
+
+    $now = [System.DateTimeOffset]::UtcNow
+    $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+    $nbf = $now.ToUnixTimeSeconds()
+
+    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_') } | ConvertTo-Json -Compress
+    $payload = @{ aud = $tokenUri; exp = $exp; iss = $clientId; jti = [System.Guid]::NewGuid().ToString(); nbf = $nbf; sub = $clientId } | ConvertTo-Json -Compress
+
+    $hB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $pB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $toSign = "$hB64.$pB64"
+    $sig = $rsa.SignData(
+        [System.Text.Encoding]::UTF8.GetBytes($toSign),
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    $jwt = "$toSign.$([Convert]::ToBase64String($sig).TrimEnd('=').Replace('+', '-').Replace('/', '_'))"
+
+    if ($debug) {
+        Write-Host "  [DEBUG] JWT Header: $header" -ForegroundColor DarkGray
+        Write-Host "  [DEBUG] JWT Payload: $payload" -ForegroundColor DarkGray
+        Write-Host "  [DEBUG] JWT Token (first 100 chars): $($jwt.Substring(0, [Math]::Min(100, $jwt.Length)))..." -ForegroundColor DarkGray
+    }
+
+    $body = @{
+        client_id             = $clientId
+        client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        client_assertion      = $jwt
+        scope                 = $scope
+        grant_type            = 'client_credentials'
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
+            -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
+        $global:token = $resp.access_token
+        $expiresIn = if ($resp.expires_in) { $resp.expires_in } else { 3600 }
+        $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)
+        Write-Host "  Connected via Certificate. Token valid until: $($global:tokenExpiry)" -ForegroundColor Green
+    }
+    catch {
+        $statusCode = $null
+        $responseBody = $null
+        
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = [System.IO.StreamReader]::new($stream)
+                $responseBody = $reader.ReadToEnd()
+                $reader.Dispose()
+            }
+            catch {}
+        }
+
+        Write-Host "  Authentication failed (Certificate): HTTP $statusCode" -ForegroundColor Red
+        if ($responseBody) {
+            Write-Host "  Server error response: $responseBody" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        Write-Host "  Diagnose: (1) Verify TenantId=$tenantId and ClientId=$clientId match Entra ID app registration" -ForegroundColor Yellow
+        Write-Host "            (2) Verify certificate thumbprint matches the one configured in Entra ID" -ForegroundColor Yellow
+        Write-Host "            (3) Set `$debug=`$true and re-run to see JWT details" -ForegroundColor Yellow
         Exit
     }
 }
@@ -527,7 +535,7 @@ function Test-ValidToken {
 function Get-SPOTokenForAdminUrl {
     <#
     .SYNOPSIS
-        Acquires or refreshes an SPO admin token for a specific admin URL.
+        Acquires or refreshes an SPO admin token for a specific admin URL using Certificate auth.
         Scope is <adminUrl>/.default, which is distinct per geo admin host.
     #>
     param (
@@ -542,55 +550,75 @@ function Get-SPOTokenForAdminUrl {
     $scope = "$AdminUrl/.default"
     $tokenUri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
 
-    if ($AuthType -eq 'ClientSecret') {
-        $body = @{
-            grant_type    = 'client_credentials'
-            client_id     = $clientId
-            client_secret = $clientSecret
-            scope         = $scope
-        }
-    }
-    elseif ($AuthType -eq 'Certificate') {
+    try {
         $cert = Get-Item -Path "Cert:\$CertStore\My\$Thumbprint" -ErrorAction Stop
-        $now = [System.DateTimeOffset]::UtcNow
-        $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
-        $nbf = $now.ToUnixTimeSeconds()
+    }
+    catch {
+        throw "Certificate $Thumbprint not found in $CertStore\My store for SPO token request to $AdminUrl."
+    }
 
-        $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_') } | ConvertTo-Json -Compress
-        $payload = @{ aud = $tokenUri; exp = $exp; iss = $clientId; jti = [System.Guid]::NewGuid().ToString(); nbf = $nbf; sub = $clientId } | ConvertTo-Json -Compress
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+    if (-not $rsa) { throw "Unable to access RSA private key for certificate $Thumbprint (SPO token)." }
 
-        $hB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        $pB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-        $toSign = "$hB64.$pB64"
-        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-        if (-not $rsa) { throw "Unable to access RSA private key for certificate $Thumbprint." }
-        $sig = $rsa.SignData(
-            [System.Text.Encoding]::UTF8.GetBytes($toSign),
-            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-        $jwt = "$toSign.$([Convert]::ToBase64String($sig).TrimEnd('=').Replace('+', '-').Replace('/', '_'))"
+    $now = [System.DateTimeOffset]::UtcNow
+    $exp = $now.AddMinutes(10).ToUnixTimeSeconds()
+    $nbf = $now.ToUnixTimeSeconds()
 
-        $body = @{
-            client_id             = $clientId
-            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
-            client_assertion      = $jwt
-            scope                 = $scope
-            grant_type            = 'client_credentials'
+    $header = @{ alg = 'RS256'; typ = 'JWT'; x5t = [Convert]::ToBase64String($cert.GetCertHash()).TrimEnd('=').Replace('+', '-').Replace('/', '_') } | ConvertTo-Json -Compress
+    $payload = @{ aud = $tokenUri; exp = $exp; iss = $clientId; jti = [System.Guid]::NewGuid().ToString(); nbf = $nbf; sub = $clientId } | ConvertTo-Json -Compress
+
+    $hB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $pB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $toSign = "$hB64.$pB64"
+    $sig = $rsa.SignData(
+        [System.Text.Encoding]::UTF8.GetBytes($toSign),
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    $jwt = "$toSign.$([Convert]::ToBase64String($sig).TrimEnd('=').Replace('+', '-').Replace('/', '_'))"
+
+    $body = @{
+        client_id             = $clientId
+        client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        client_assertion      = $jwt
+        scope                 = $scope
+        grant_type            = 'client_credentials'
+    }
+
+    try {
+        $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
+            -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
+
+        $expiresIn = if ($resp.expires_in) { [int]$resp.expires_in } else { 3600 }
+        $expiry = (Get-Date).AddSeconds($expiresIn - 300)
+        $global:spoTokenByAdminUrl[$AdminUrl] = @{ access_token = $resp.access_token; expiry = $expiry }
+
+        Write-Host "  SPO token acquired for $AdminUrl. Valid until: $expiry" -ForegroundColor Green
+        return $resp.access_token
+    }
+    catch {
+        $statusCode = $null
+        $responseBody = $null
+
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = [System.IO.StreamReader]::new($stream)
+                $responseBody = $reader.ReadToEnd()
+                $reader.Dispose()
+            }
+            catch {}
         }
+
+        Write-Host "  SPO token acquisition failed for $AdminUrl — HTTP $statusCode" -ForegroundColor Red
+        if ($responseBody) {
+            Write-Host "  Server error: $responseBody" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        throw $_
     }
-    else {
-        throw "Invalid AuthType '$AuthType'. Use 'Certificate' or 'ClientSecret'."
-    }
-
-    $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-        -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
-
-    $expiresIn = if ($resp.expires_in) { [int]$resp.expires_in } else { 3600 }
-    $expiry = (Get-Date).AddSeconds($expiresIn - 300)
-    $global:spoTokenByAdminUrl[$AdminUrl] = @{ access_token = $resp.access_token; expiry = $expiry }
-
-    Write-Host "  SPO token acquired for $AdminUrl. Valid until: $expiry" -ForegroundColor Green
-    return $resp.access_token
 }
 
 #endregion Authentication Functions
@@ -1375,11 +1403,20 @@ function Get-ArchivedOneDriveSitesFromSPOExport {
     .SYNOPSIS
         Fast-path collector for archived OneDrive accounts by downloading the
         SharePoint Admin "Unlicensed OneDrive" CSV per configured admin URL.
+        Requires Certificate authentication.
     #>
     $fromCsv = [System.Collections.Generic.List[object]]::new()
     $global:spoDownloadedReportFiles.Clear()
     $global:spoDownloadedReportRows.Clear()
     $global:spoMergedDownloadReportPath = ''
+
+    # SPO Admin API only supports Certificate auth, not ClientSecret
+    if ($AuthType -ne 'Certificate') {
+        Write-Host '  ERROR: SharePoint Admin API requires Certificate authentication.' -ForegroundColor Red
+        Write-Host '         ClientSecret is not supported. Set $AuthType = "Certificate" in the configuration.' -ForegroundColor Yellow
+        Write-Host '         Skipping archived OneDrive collection.' -ForegroundColor Yellow
+        return $fromCsv
+    }
 
     $mergedRawRows = [System.Collections.Generic.List[object]]::new()
 
@@ -1903,29 +1940,13 @@ if ($allCandidates.Count -eq 0 -and -not $GetCurrentlyArchived) {
     Exit
 }
 
-# Step 4b (Phase 2b): Archived OneDrive sites discovered via GET /sites/getAllSites.
-# These are personal OneDrive sites archived by Microsoft whose Entra user was deleted
-# >30 days ago (purged from the recycle bin). Drive info is gathered inside the function
-# via GET /sites/{siteId}/drive, so Phase 4 does not process these.
 $archivedSites = [System.Collections.Generic.List[object]]::new()
 if ($GetCurrentlyArchived) {
-    $rawArchivedSites = [System.Collections.Generic.List[object]]::new()
+    Write-Host "`nPhase 2b: Downloading archived OneDrive accounts from SharePoint Admin API..." -ForegroundColor Cyan
+    $rawArchivedSites = Get-ArchivedOneDriveSitesFromSPOExport
 
-    switch ($ArchivedCollectionMode) {
-        'SPODownload' {
-            $rawArchivedSites = Get-ArchivedOneDriveSitesFromSPOExport
-
-            if ($rawArchivedSites.Count -eq 0) {
-                Write-Host '  Phase 2b: SPO export returned no archived rows.' -ForegroundColor Gray
-            }
-        }
-        'GraphSites' {
-            $rawArchivedSites = Get-ArchivedOneDriveSites
-        }
-        default {
-            Write-Host "  Invalid ArchivedCollectionMode '$ArchivedCollectionMode'. Using 'SPODownload'." -ForegroundColor Yellow
-            $rawArchivedSites = Get-ArchivedOneDriveSitesFromSPOExport
-        }
+    if ($rawArchivedSites.Count -eq 0) {
+        Write-Host '  Phase 2b: SPO export returned no archived rows.' -ForegroundColor Gray
     }
 
     # Deduplicate: if a UPN from the Sites API already exists in $allCandidates (e.g., a user
