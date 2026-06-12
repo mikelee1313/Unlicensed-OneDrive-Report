@@ -100,7 +100,7 @@ Graph Application Perms:
 - `AuditLog.Read.All` (license-removal date enrichment)
 
  **Required SharePoint  Permissions (Application type):**
-- 'Sites.FullControl.All'  - Required to Download OneDrive Reports from the Admin API 
+- `Sites.FullControl.All`  - Required to Download OneDrive Reports from the Admin API 
     
 **Optional features:**
 - `Sites.Read.All` (if `GraphSites` mode is used)
