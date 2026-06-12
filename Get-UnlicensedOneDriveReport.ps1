@@ -155,6 +155,7 @@ $ArchivedCollectionMode = 'SPODownload'
 $SPOAdminUrls = @(
     'https://m365cpi13246019-admin.sharepoint.com'
 )
+    
 
 # Poll settings for SPO ExportToCSV download.
 $SPOExportPollIntervalSec = 5
@@ -191,7 +192,7 @@ $SendEmailNotifications = $false
 
 # Recipients — individual addresses or mail-enabled group/distribution-list addresses.
 $EmailTo = @(
-    'admin@contoso.onmicrosoft.com'
+    'admin@contoso.onmicrosoft.com',
     'Test-Email-Security-Group@contoso.onmicrosoft.com'
 )
 
@@ -1409,14 +1410,6 @@ function Get-ArchivedOneDriveSitesFromSPOExport {
     $global:spoDownloadedReportFiles.Clear()
     $global:spoDownloadedReportRows.Clear()
     $global:spoMergedDownloadReportPath = ''
-
-    # SPO Admin API only supports Certificate auth, not ClientSecret
-    if ($AuthType -ne 'Certificate') {
-        Write-Host '  ERROR: SharePoint Admin API requires Certificate authentication.' -ForegroundColor Red
-        Write-Host '         ClientSecret is not supported. Set $AuthType = "Certificate" in the configuration.' -ForegroundColor Yellow
-        Write-Host '         Skipping archived OneDrive collection.' -ForegroundColor Yellow
-        return $fromCsv
-    }
 
     $mergedRawRows = [System.Collections.Generic.List[object]]::new()
 
