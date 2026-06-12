@@ -4,6 +4,41 @@ PowerShell script to identify and report unlicensed OneDrive accounts across a M
 
 This script primarily uses Microsoft Graph application permissions and can also download the SharePoint Admin unlicensed OneDrive report (ExportToCSV) for archive-focused enrichment.
 
+## UnlicensedOneDrive Report Script Summary
+
+This PowerShell script identifies and reports on **unlicensed OneDrive accounts** across a Microsoft 365 tenant, including multi-geo environments. It's designed to help organizations comply with Microsoft's enforcement timeline for unlicensed OneDrive accounts (effective January 27, 2025) and track the **post-archive deletion timeline** introduced in **Change Notice MC1381110**.
+
+### What It Does
+
+The script discovers three populations of unlicensed OneDrive accounts:
+
+1. **Active Entra ID Users** — Users with active accounts but no enabled OneDrive/SharePoint license
+2. **Soft-Deleted Users** — Users in the Entra ID 30-day recycle bin (whose OneDrives still exist)
+3. **Archived OneDrive Sites** — Personal OneDrive sites already archived by Microsoft after the owner was purged from Entra ID (>30 days post-deletion)
+
+For each account, it collects:
+- User/site identity and display names
+- License status and removal dates (via audit logs)
+- OneDrive storage usage (GB) and URL
+- Calculated timelines for read-only, archive, and deletion phases
+
+### Critical Deletion Risk Timeline (MC1381110)
+
+The script enforces Microsoft's documented archival timeline and **deletion risk window** as defined in **Change Notice MC1381110**:
+
+| Phase | Days from Unlicensed | Status | Risk |
+|-------|---|---|---|
+| **Read-Only** | Day 60 | OneDrive becomes read-only | Sites are inaccessible for writes |
+| **Archived** | Day 93 | OneDrive archived by Microsoft | Minimal metadata queries; high retrieval cost |
+| **Deletion Window** | Days 94–365+ | ⚠️ **DELETION RISK (MC1381110)** | If PAYG not enabled, archived accounts are deleted after ~365 days |
+
+#### Deletion Risk Details (MC1381110)
+- **If PAYG is NOT enabled** (default): Archived unlicensed OneDrive accounts are subject to **automatic deletion** after approximately **365 days** from the unlicensed date per MC1381110, even if a retention hold exists.
+- **If PAYG is enabled**: Archived accounts persist indefinitely but incur **$0.05/GB/month** storage fees and **$0.60/GB** one-time reactivation costs.
+- **Manual Config**: The script uses a manual setting (`$PayGEnabledForUnlicensedOneDrive`) since Microsoft has no API to read PAYG status.
+
+The script calculates **DaysUntilDeletion** for each archived account (configurable via `$ArchiveDeletionThresholdDays`, defaulting to 365) and sends alert emails when deletion risk approaches the configured threshold (default: 30 days before Day 365).
+
 ## What This Script Does
 
 The script reports three account populations:
@@ -23,13 +58,18 @@ For each discovered account/site, it can include:
 
 ## Key Capabilities
 
-- Multi-geo aware by design through Graph routing.
-- Bulk user enumeration with paging.
-- Bulk audit-log lookup for license removal dates.
-- Graph batch API for faster drive lookups.
-- SharePoint Admin ExportToCSV downloader for archived/unlicensed reporting.
-- Optional merge of downloaded SPO report rows into final dataset.
-- Optional HTML email notifications for upcoming read-only/archive windows.
+- **Multi-geo support** — Single app registration and token covers all datacenters (NAM, APC, CAN, DEU, GBR, IND, JPN, etc.)
+- **MC1381110 compliance reporting** — Tracks post-archive deletion timeline and PAYG reactivation risk
+- **Audit log integration** — Bulk query for license-change dates (optional, requires `AuditLog.Read.All`)
+- **SharePoint Admin integration** — Downloads existing unlicensed reports from SPO admin portals
+- **Email alerts** — Notifies admins of approaching read-only, archive, and deletion milestones
+- **Cost estimation** — Calculates storage fees and reactivation costs based on tenant PAYG status
+- **Throttle handling** — Built-in retry logic with exponential backoff for Graph API rate limits
+- **Graph API only** — No SPO PowerShell module or per-geo token management required
+- Bulk user enumeration with paging
+- Graph batch API for faster drive lookups
+- Optional merge of downloaded SPO report rows into final dataset
+- Optional HTML email notifications for upcoming read-only/archive windows
 
 ## Important Design Decisions
 
@@ -40,7 +80,7 @@ For each discovered account/site, it can include:
 
 ## Prerequisites
 
-## Runtime
+### Runtime
 
 - PowerShell 7+ recommended (Windows supported).
 - Network access to:
@@ -48,17 +88,17 @@ For each discovered account/site, it can include:
   - `https://login.microsoftonline.com`
   - SharePoint admin endpoints in `$SPOAdminUrls`
 
-## App Registration and Permissions
+### App Registration and Permissions
 
 Use an Entra app registration with application permissions:
 
-Required for core report:
+**Required for core report:**
 
 - `User.Read.All`
 - `Directory.Read.All`
 - `Files.Read.All`
 
-Optional features:
+**Optional features:**
 
 - `AuditLog.Read.All` (license-removal date enrichment)
 - `Sites.Read.All` (if `GraphSites` mode is used)
@@ -66,7 +106,7 @@ Optional features:
 
 Admin consent must be granted for the configured permissions.
 
-## Authentication
+### Authentication
 
 The script supports:
 
@@ -107,6 +147,7 @@ Most important settings:
   - `$EmailFrom`
   - `$DaysToNotifyBeforeReadOnly`
   - `$DaysToNotifyBeforeArchive`
+  - `$DaysToNotifyBeforeDeletion`
 
 ## Mode Guidance
 
@@ -176,7 +217,7 @@ Notes:
 <img width="1865" height="161" alt="image" src="https://github.com/user-attachments/assets/3308163e-707e-4bf9-a374-9cc30fec990e" />
 
 
-## E-Mail Notifcation Samples:
+## E-Mail Notification Samples:
 
 <img width="1249" height="261" alt="image" src="https://github.com/user-attachments/assets/f25bf2e0-4f98-49e2-8cc5-dd11f750276c" />
 
