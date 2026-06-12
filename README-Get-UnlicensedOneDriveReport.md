@@ -93,14 +93,16 @@ For each discovered account/site, it can include:
 Use an Entra app registration with application permissions:
 
 **Required for core report:**
-
+Graph Application Perms:
 - `User.Read.All`
 - `Directory.Read.All`
 - `Files.Read.All`
-
-**Optional features:**
-
 - `AuditLog.Read.All` (license-removal date enrichment)
+
+ **Required SharePoint  Permissions (Application type):**
+- 'Sites.FullControl.All'  - Required to Download OneDrive Reports from the Admin API 
+    
+**Optional features:**
 - `Sites.Read.All` (if `GraphSites` mode is used)
 - `Mail.Send` (email notifications)
 
