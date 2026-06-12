@@ -69,9 +69,6 @@
       Mail.Send               — [OPTIONAL] Send alert emails via Graph API (POST /users/{sender}/sendMail)
                                  Set $SendEmailNotifications = $false to skip.
                                  The $EmailFrom mailbox must be a licensed Exchange Online mailbox.
-    
-    Required SharePoint  Permissions (Application type):
-    Sites.FullControl.All  - Required to Download OneDrive Reports from the Admin API 
 
     A SINGLE app registration in the HOME TENANT covers all geo locations.
     No per-geo tokens required — Graph handles multi-geo routing automatically.
@@ -710,53 +707,100 @@ function Get-LicenseChangeDates {
 
     $lookupTable = [System.Collections.Generic.Dictionary[string, datetime]]::new()
     $cutoffDate = (Get-Date).AddDays(-$AuditLogLookbackDays)
+    $cutoffDateUtc = $cutoffDate.ToUniversalTime().ToString('o')
 
     # directoryAudits does not support 'or' on activityDisplayName in a single $filter.
-    # The activityDateTime ge filter also causes 400 in some tenants, so date filtering
-    # is done in PowerShell after retrieving results.
+    # Prefer a server-side activityDateTime filter to cut request volume, then fall back
+    # to client-side cutoff logic if the tenant rejects the combined filter/orderby.
     $activityNames = @('Change user license', 'Remove user from licensed group')
     $eventCount = 0
     $queryFailed = $false
 
     foreach ($activityName in $activityNames) {
-        $encodedFilter = [Uri]::EscapeDataString("activityDisplayName eq '$activityName'")
-        $nextUri = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$encodedFilter&`$select=activityDateTime,targetResources&`$top=500"
-
-        do {
-            Test-ValidToken
-            $headers = @{ Authorization = "Bearer $global:token" }
-
-            try {
-                $response = Invoke-GraphRequestWithThrottleHandling -Uri $nextUri -Method GET -Headers $headers
+        $filterWithDate = [Uri]::EscapeDataString("activityDisplayName eq '$activityName' and activityDateTime ge $cutoffDateUtc")
+        $filterWithoutDate = [Uri]::EscapeDataString("activityDisplayName eq '$activityName'")
+        $queryModes = @(
+            @{
+                Name            = 'server-side date filter'
+                Uri             = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$filterWithDate&`$select=activityDateTime,targetResources&`$orderby=activityDateTime desc&`$top=500"
+                AllowsEarlyStop = $false
+            },
+            @{
+                Name            = 'fallback scan'
+                Uri             = "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=$filterWithoutDate&`$select=activityDateTime,targetResources&`$orderby=activityDateTime desc&`$top=500"
+                AllowsEarlyStop = $true
             }
-            catch {
-                Write-Host "  Warning: Audit log query failed for '$activityName'. Verify AuditLog.Read.All is granted." -ForegroundColor Yellow
-                Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
-                $queryFailed = $true
-                break
-            }
+        )
+        $completedActivity = $false
 
-            foreach ($auditEvent in $response.value) {
-                $eventCount++
-                $eventDate = $null
-                try { $eventDate = [datetime]::Parse($auditEvent.activityDateTime) } catch { continue }
-                if ($eventDate -lt $cutoffDate) { continue }
+        foreach ($queryMode in $queryModes) {
+            $nextUri = $queryMode.Uri
+            $shouldTryNextMode = $false
 
-                foreach ($target in $auditEvent.targetResources) {
-                    if (-not $target.id) { continue }
-                    if (-not $TargetUserIds.Contains($target.id)) { continue }
-                    if (-not $lookupTable.ContainsKey($target.id) -or $eventDate -gt $lookupTable[$target.id]) {
-                        $lookupTable[$target.id] = $eventDate
+            do {
+                Test-ValidToken
+                $headers = @{ Authorization = "Bearer $global:token" }
+
+                try {
+                    $response = Invoke-GraphRequestWithThrottleHandling -Uri $nextUri -Method GET -Headers $headers
+                }
+                catch {
+                    $statusCode = $null
+                    if ($_.Exception.Response) {
+                        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
                     }
+
+                    if ($statusCode -eq 400 -and $queryMode.Name -eq 'server-side date filter') {
+                        Write-Host "  '$activityName' rejected the date-bounded filter. Retrying with fallback scan..." -ForegroundColor Yellow
+                        $shouldTryNextMode = $true
+                        break
+                    }
+
+                    Write-Host "  Warning: Audit log query failed for '$activityName'. Verify AuditLog.Read.All is granted." -ForegroundColor Yellow
+                    Write-Host "  $($_.Exception.Message)" -ForegroundColor Yellow
+                    $queryFailed = $true
                     break
                 }
-            }
 
-            Write-Host "  [$activityName] Audit events processed: $eventCount | Dates found: $($lookupTable.Count)..." -ForegroundColor Gray
-            $nextUri = $response.'@odata.nextLink'
-        } while ($nextUri)
+                $pageNewestEventDate = $null
+
+                foreach ($auditEvent in $response.value) {
+                    $eventCount++
+                    $eventDate = $null
+                    try { $eventDate = [datetime]::Parse($auditEvent.activityDateTime) } catch { continue }
+                    if (-not $pageNewestEventDate -or $eventDate -gt $pageNewestEventDate) {
+                        $pageNewestEventDate = $eventDate
+                    }
+                    if ($eventDate -lt $cutoffDate) { continue }
+
+                    foreach ($target in $auditEvent.targetResources) {
+                        if (-not $target.id) { continue }
+                        if (-not $TargetUserIds.Contains($target.id)) { continue }
+                        if (-not $lookupTable.ContainsKey($target.id) -or $eventDate -gt $lookupTable[$target.id]) {
+                            $lookupTable[$target.id] = $eventDate
+                        }
+                        break
+                    }
+                }
+
+                Write-Host "  [$activityName][$($queryMode.Name)] Audit events processed: $eventCount | Dates found: $($lookupTable.Count)..." -ForegroundColor Gray
+                $nextUri = $response.'@odata.nextLink'
+
+                if ($queryMode.AllowsEarlyStop -and $pageNewestEventDate -and $pageNewestEventDate -lt $cutoffDate) {
+                    Write-Host "  [$activityName] Remaining audit pages are older than the lookback window. Stopping fallback scan early." -ForegroundColor Gray
+                    $nextUri = $null
+                }
+            } while ($nextUri)
+
+            if ($queryFailed) { break }
+            if ($shouldTryNextMode) { continue }
+
+            $completedActivity = $true
+            break
+        }
 
         if ($queryFailed) { break }
+        if (-not $completedActivity) { break }
     }
 
     $missing = $TargetUserIds.Count - $lookupTable.Count
