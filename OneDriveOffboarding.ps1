@@ -70,6 +70,14 @@ $linkExpiryDaysAfterDeletion = 90
 # Set to $false to grant SCA only, leaving the site accessible.
 $lockSite = $false
 
+# Manager escalation level for offboarding workflow.
+# 1 = user's direct manager, 2 = manager's manager, 3 = manager's manager's manager
+$managerLevel = 3
+
+# Whether to grant SCA and send notification to all manager levels (true)
+# or only the first level manager (false).
+$givePermsToAllManagers = $false
+
 # How far back to search audit logs for license-change events when no DeletedDate
 # is supplied and the user is not in the Entra soft-delete bin.
 # Requires AuditLog.Read.All on the app registration. Set to 0 to skip audit lookup.
@@ -82,7 +90,7 @@ $runStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $outputCsvPath = Join-Path $outputFolder "OneDrive_Manager_Handoff_$runStamp.csv"
 
 # Basic logging
-$debug = $true
+$debug = $false
 #endregion Configuration
 
 #region Globals
@@ -256,19 +264,42 @@ function Get-UserAndManager {
 
     $user = $userResp.value[0]
 
-    $managerUri = "https://graph.microsoft.com/v1.0/users/$($user.id)/manager?`$select=id,displayName,userPrincipalName,mail"
-    $manager = $null
+    # Fetch the requested number of manager levels in the hierarchy.
+    $managers = [System.Collections.Generic.List[object]]::new()
+    $currentUserId = $user.id
 
-    try {
-        $manager = Invoke-Graph -Method GET -Uri $managerUri
-    }
-    catch {
-        throw "No manager found for $UserPrincipalName in the manager field."
+    for ($level = 1; $level -le $managerLevel; $level++) {
+        $managerUri = "https://graph.microsoft.com/v1.0/users/$currentUserId/manager?`$select=id,displayName,userPrincipalName,mail"
+        $currentManager = $null
+
+        try {
+            $currentManager = Invoke-Graph -Method GET -Uri $managerUri
+        }
+        catch {
+            if ($level -eq 1) {
+                throw "No manager found for $UserPrincipalName in the manager field."
+            }
+            else {
+                Write-Log -Message "No manager found at level $level for user $UserPrincipalName." -Level WARN
+                break
+            }
+        }
+
+        if ($currentManager) {
+            $managers.Add($currentManager)
+            $currentUserId = $currentManager.id
+        }
+        else {
+            if ($level -eq 1) {
+                throw "No manager found for $UserPrincipalName in the manager field."
+            }
+            break
+        }
     }
 
     return [PSCustomObject]@{
-        User    = $user
-        Manager = $manager
+        User     = $user
+        Managers = $managers
     }
 }
 
@@ -393,7 +424,7 @@ function Get-OneDriveUrl {
 function Set-ManagerAccessAndReadOnly {
     param(
         [Parameter(Mandatory)] [string]$OneDriveUrl,
-        [Parameter(Mandatory)] [string]$ManagerUpn
+        [Parameter(Mandatory)] [string[]]$ManagerUpns
     )
 
     # Both operations run from the tenant admin context (app-only).
@@ -402,12 +433,14 @@ function Set-ManagerAccessAndReadOnly {
     $adminUrl = "https://$tenantName-admin.sharepoint.com"
     Connect-PnPOnline -Url $adminUrl -ClientId $clientId -Thumbprint $thumbprint -Tenant $tenantId -WarningAction SilentlyContinue
 
-    try {
-        Write-Log -Message "Granting SCA to '$ManagerUpn' on '$OneDriveUrl'..." -Level INFO
-        Set-PnPTenantSite -Identity $OneDriveUrl -Owners $ManagerUpn -ErrorAction Stop | Out-Null
-    }
-    catch {
-        throw "Failed to grant SCA on site '$OneDriveUrl' for manager '$ManagerUpn': $($_.Exception.Message)"
+    foreach ($managerUpn in $ManagerUpns) {
+        try {
+            Write-Log -Message "Granting SCA to '$managerUpn' on '$OneDriveUrl'..." -Level INFO
+            Set-PnPTenantSite -Identity $OneDriveUrl -Owners $managerUpn -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw "Failed to grant SCA on site '$OneDriveUrl' for manager '$managerUpn': $($_.Exception.Message)"
+        }
     }
 
     if ($lockSite) {
@@ -704,7 +737,10 @@ foreach ($row in $rows) {
     try {
         $identity = Get-UserAndManager -UserPrincipalName $upn
         $user = $identity.User
-        $manager = $identity.Manager
+        $managers = $identity.Managers
+
+        # Determine which managers should receive permissions and notifications
+        $targetManagers = if ($givePermsToAllManagers) { $managers } else { @($managers[0]) }
 
         $oneDriveUrl = Get-OneDriveUrl -UserId $user.id -InputOneDriveUrl ([string]($row | Select-Object -ExpandProperty OneDriveUrl -ErrorAction SilentlyContinue))
         $deletedDate = $null
@@ -741,20 +777,39 @@ foreach ($row in $rows) {
             }
         }
 
-        $siteLockState = Set-ManagerAccessAndReadOnly -OneDriveUrl $oneDriveUrl -ManagerUpn $manager.userPrincipalName
+        $siteLockState = Set-ManagerAccessAndReadOnly -OneDriveUrl $oneDriveUrl -ManagerUpns @($targetManagers | ForEach-Object { $_.userPrincipalName })
         $sharingLinks = @(Get-OneDriveSharingLinks -OneDriveUrl $oneDriveUrl)
 
-        Send-ManagerNotification -User $user -Manager $manager -OneDriveUrl $oneDriveUrl -DeletedDate $deletedDate -SiteLockState $siteLockState -SharingLinks $sharingLinks
+        foreach ($targetManager in $targetManagers) {
+            Send-ManagerNotification -User $user -Manager $targetManager -OneDriveUrl $oneDriveUrl -DeletedDate $deletedDate -SiteLockState $siteLockState -SharingLinks $sharingLinks
+        }
 
-        $results.Add([PSCustomObject]@{
+        # Build manager columns for output CSV - include all levels up to $managerLevel
+        $managerOutput = @{}
+        for ($i = 1; $i -le $managerLevel; $i++) {
+            if ($i -le @($managers).Count) {
+                $managerOutput["Manager$i"] = $managers[$i - 1].userPrincipalName
+            }
+            else {
+                $managerOutput["Manager$i"] = ''
+            }
+        }
+
+        $resultObject = [PSCustomObject]@{
                 UserPrincipalName = $user.userPrincipalName
-                Manager           = $manager.userPrincipalName
                 OneDriveUrl       = $oneDriveUrl
                 SiteLockState     = $siteLockState
                 SharingLinkCount  = @($sharingLinks).Count
                 NotificationSent  = $true
                 Notes             = ''
-            })
+            }
+
+        # Add manager columns in order
+        for ($i = 1; $i -le $managerLevel; $i++) {
+            $resultObject | Add-Member -NotePropertyName "Manager$i" -NotePropertyValue $managerOutput["Manager$i"]
+        }
+
+        $results.Add($resultObject)
 
         Write-Log -Message "Completed $upn" -Level INFO
     }
@@ -762,15 +817,21 @@ foreach ($row in $rows) {
         $err = $_.Exception.Message
         Write-Log -Message "Failed for $upn : $err" -Level ERROR
 
-        $results.Add([PSCustomObject]@{
+        $errorResultObject = [PSCustomObject]@{
                 UserPrincipalName = $upn
-                Manager           = ''
                 OneDriveUrl       = ''
                 SiteLockState     = ''
                 SharingLinkCount  = 0
                 NotificationSent  = $false
                 Notes             = $err
-            })
+            }
+
+        # Add empty manager columns for consistency
+        for ($i = 1; $i -le $managerLevel; $i++) {
+            $errorResultObject | Add-Member -NotePropertyName "Manager$i" -NotePropertyValue ''
+        }
+
+        $results.Add($errorResultObject)
     }
 }
 #endregion User Processing Loop
