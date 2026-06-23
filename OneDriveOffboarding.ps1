@@ -82,7 +82,7 @@ $runStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $outputCsvPath = Join-Path $outputFolder "OneDrive_Manager_Handoff_$runStamp.csv"
 
 # Basic logging
-$debug = $false
+$debug = $true
 #endregion Configuration
 
 #region Globals
@@ -347,7 +347,7 @@ function Get-UserUnlicensedDateFromAudit {
                 }
             }
 
-            $nextUri = if ($stopPaging) { $null } else { $resp.'@odata.nextLink' }
+            $nextUri = if ($stopPaging) { $null } else { $resp | Select-Object -ExpandProperty '@odata.nextLink' -ErrorAction SilentlyContinue }
         } while ($nextUri)
     }
 
@@ -450,10 +450,11 @@ function Get-OneDriveSharingLinks {
 
     $sharingLinks = [System.Collections.Generic.List[object]]::new()
 
-    Connect-PnPOnline -Url $OneDriveUrl -ClientId $clientId -Thumbprint $thumbprint -Tenant $tenantId -WarningAction SilentlyContinue
+    try {
+        Connect-PnPOnline -Url $OneDriveUrl -ClientId $clientId -Thumbprint $thumbprint -Tenant $tenantId -WarningAction SilentlyContinue
 
-    $groups = Get-PnPGroup | Where-Object { $_.Title -like 'SharingLinks*' }
-    foreach ($group in $groups) {
+        $groups = Get-PnPGroup | Where-Object { $_.Title -like 'SharingLinks*' }
+        foreach ($group in $groups) {
         $groupName = $group.Title
         $documentId = $null
 
@@ -469,7 +470,7 @@ function Get-OneDriveSharingLinks {
             $members = @()
         }
 
-        $memberText = if ($members.Count -gt 0) {
+        $memberText = if (@($members).Count -gt 0) {
             ($members | ForEach-Object {
                 if ($_.Email) { "$($_.Title) <$($_.Email)>" } else { $_.Title }
             }) -join '; '
@@ -527,23 +528,23 @@ function Get-OneDriveSharingLinks {
 
                 if ($match) {
                     $linkId = $match.Id
-                    if ($match.link -and $match.link.WebUrl) {
+                    if ($match.link -and ($match.link | Select-Object -ExpandProperty WebUrl -ErrorAction SilentlyContinue)) {
                         $linkUrl = $match.link.WebUrl
                     }
-                    if ($match.link -and $match.link.ExpirationDateTime) {
+                    if ($match.link -and ($match.link | Select-Object -ExpandProperty ExpirationDateTime -ErrorAction SilentlyContinue)) {
                         try {
                             $linkExpiration = ([datetime]::Parse($match.link.ExpirationDateTime)).ToString('yyyy-MM-dd HH:mm:ss')
                         }
                         catch {
-                            $linkExpiration = [string]$match.link.ExpirationDateTime
+                            $linkExpiration = [string]($match.link | Select-Object -ExpandProperty ExpirationDateTime -ErrorAction SilentlyContinue)
                         }
                     }
-                    elseif ($match.ExpirationDateTime) {
+                    elseif ($match | Select-Object -ExpandProperty ExpirationDateTime -ErrorAction SilentlyContinue) {
                         try {
-                            $linkExpiration = ([datetime]::Parse($match.ExpirationDateTime)).ToString('yyyy-MM-dd HH:mm:ss')
+                            $linkExpiration = ([datetime]::Parse(($match | Select-Object -ExpandProperty ExpirationDateTime -ErrorAction SilentlyContinue))).ToString('yyyy-MM-dd HH:mm:ss')
                         }
                         catch {
-                            $linkExpiration = [string]$match.ExpirationDateTime
+                            $linkExpiration = [string]($match | Select-Object -ExpandProperty ExpirationDateTime -ErrorAction SilentlyContinue)
                         }
                     }
                 }
@@ -565,6 +566,10 @@ function Get-OneDriveSharingLinks {
                 SharingLinkExpiration = $linkExpiration
                 SharingLinkMembers    = $memberText
             })
+        }
+    }
+    catch {
+        Write-Log -Message "Error retrieving sharing links for $OneDriveUrl : $($_.Exception.Message)" -Level WARN
     }
 
     return $sharingLinks
@@ -587,7 +592,7 @@ function Send-ManagerNotification {
 
     $managerAddress = if ($Manager.mail) { $Manager.mail } else { $Manager.userPrincipalName }
 
-    $rows = if ($SharingLinks.Count -gt 0) {
+    $rows = if (@($SharingLinks).Count -gt 0) {
         $SharingLinks | ForEach-Object {
             $safeGroup = [System.Web.HttpUtility]::HtmlEncode($_.SharingGroupName)
             $safeMembers = [System.Web.HttpUtility]::HtmlEncode($_.SharingLinkMembers)
@@ -679,7 +684,7 @@ $adminUrl = "https://$tenantName-admin.sharepoint.com"
 Connect-PnPOnline -Url $adminUrl -ClientId $clientId -Thumbprint $thumbprint -Tenant $tenantId -WarningAction SilentlyContinue
 
 $rows = Import-Csv -Path $inputCsvPath
-if (-not $rows -or $rows.Count -eq 0) {
+if (-not $rows -or @($rows).Count -eq 0) {
     throw "Input CSV has no rows: $inputCsvPath"
 }
 #endregion Initialization
@@ -701,15 +706,16 @@ foreach ($row in $rows) {
         $user = $identity.User
         $manager = $identity.Manager
 
-        $oneDriveUrl = Get-OneDriveUrl -UserId $user.id -InputOneDriveUrl ([string]$row.OneDriveUrl)
+        $oneDriveUrl = Get-OneDriveUrl -UserId $user.id -InputOneDriveUrl ([string]($row | Select-Object -ExpandProperty OneDriveUrl -ErrorAction SilentlyContinue))
         $deletedDate = $null
 
-        if (-not [string]::IsNullOrWhiteSpace([string]$row.DeletedDate)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]($row | Select-Object -ExpandProperty DeletedDate -ErrorAction SilentlyContinue))) {
             try {
-                $deletedDate = [datetime]::Parse([string]$row.DeletedDate)
+                $deletedDate = [datetime]::Parse([string]($row | Select-Object -ExpandProperty DeletedDate -ErrorAction SilentlyContinue))
             }
             catch {
-                Write-Log -Message "DeletedDate '$($row.DeletedDate)' is invalid for $upn. Using current date." -Level WARN
+                $csvDeletedDate = $row | Select-Object -ExpandProperty DeletedDate -ErrorAction SilentlyContinue
+                Write-Log -Message "DeletedDate '$($csvDeletedDate)' is invalid for $upn. Using current date." -Level WARN
             }
         }
 
@@ -745,7 +751,7 @@ foreach ($row in $rows) {
                 Manager           = $manager.userPrincipalName
                 OneDriveUrl       = $oneDriveUrl
                 SiteLockState     = $siteLockState
-                SharingLinkCount  = $sharingLinks.Count
+                SharingLinkCount  = @($sharingLinks).Count
                 NotificationSent  = $true
                 Notes             = ''
             })
