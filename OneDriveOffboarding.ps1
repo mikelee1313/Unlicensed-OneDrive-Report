@@ -72,7 +72,7 @@ $lockSite = $false
 
 # Manager escalation level for offboarding workflow.
 # 1 = user's direct manager, 2 = manager's manager, 3 = manager's manager's manager
-$managerLevel = 3
+$managerLevel = 1
 
 # Whether to grant SCA and send notification to all manager levels (true)
 # or only the first level manager (false).
