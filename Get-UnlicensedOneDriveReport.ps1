@@ -99,7 +99,7 @@
 ##############################################################
 
 # ---- Debug output ----
-$debug = $true
+$debug = $false
 
 # ---- Tenant & App Registration ----
 # A SINGLE registration in the home (NAM) tenant covers all geo locations.
