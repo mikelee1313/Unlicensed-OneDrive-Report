@@ -37,9 +37,11 @@
     LIMITATION: Users deleted >30 days ago whose OneDrive has already been purged
     (not just archived) are permanently gone and cannot be discovered via Graph.
 
-    Timeline per Microsoft docs (enforcement began Jan 27, 2025):
-      Day 60 → read-only mode
-      Day 93 → archived (or deletion begins if billing not enabled)
+        Timeline per Microsoft docs (enforcement began Jan 27, 2025):
+            Day 60  → read-only mode
+            Day 93  → archived
+            Day 275 → archived site can become undiscoverable with eDiscovery if PAYG is not enabled
+            Day 365 → deletion risk window
     https://learn.microsoft.com/en-us/sharepoint/unlicensed-onedrive-accounts
 
 .PARAMETER None
@@ -122,9 +124,21 @@ $ReadOnlyThresholdDays = 60
 $ArchiveThresholdDays = 93
 
 # ---- Post-archive deletion timeline (MC1381110) ----
+# Archived sites without PAYG become undiscoverable through eDiscovery after
+# this many days from the unlicensed date.
+$UndiscoverableThresholdDays = 275
+
+# If an archived site is reactivated but remains unlicensed, it is automatically
+# archived again after this many days.
+$RearchiveThresholdDays = 30
+
 # If PAYG is not enabled, archived OneDrive accounts are subject to deletion
 # after this many days from unlicensed date (even if retention hold exists).
 $ArchiveDeletionThresholdDays = 365
+
+# MC1381110 rollout floor date. Deletion risk is not enforced before this date,
+# even when an account has already exceeded ArchiveDeletionThresholdDays.
+$DeletionEnforcementStartDate = [datetime]'2027-07-01'
 
 # PAYG status for archived unlicensed OneDrive accounts.
 # IMPORTANT: There is no reliable API/cmdlet readback for this tenant toggle,
@@ -184,10 +198,11 @@ $ReactivationCostPerGB = 0.60   # USD per GB one-time fee to reactivate an archi
 
 # ---- Email Notifications ----
 # Set $SendEmailNotifications = $true to send alert emails to admins after the report runs.
-# Three separate emails are sent when accounts fall within the configured day thresholds:
+# Four separate emails are sent when accounts fall within the configured day thresholds:
 #   (1) Approaching Read-Only  — when DaysUntilReadOnly  <= $DaysToNotifyBeforeReadOnly
 #   (2) Approaching Archive    — when DaysUntilArchive   <= $DaysToNotifyBeforeArchive
-#   (3) Approaching Deletion   — when DaysUntilDeletion  <= $DaysToNotifyBeforeDeletion
+#   (3) Approaching Rearchive  — when DaysUntilRearchive <= $DaysToNotifyBeforeRearchive
+#   (4) Approaching Deletion   — when DaysUntilDeletion  <= $DaysToNotifyBeforeDeletion
 $SendEmailNotifications = $false
 
 # Recipients — individual addresses or mail-enabled group/distribution-list addresses.
@@ -205,6 +220,7 @@ $EmailFrom = 'admin@contoso.onmicrosoft.com'
 # at or below this value. Set to 0 to only notify on the day of the event itself.
 $DaysToNotifyBeforeReadOnly = 14   # Notify admins this many days before a site goes read-only
 $DaysToNotifyBeforeArchive = 14   # Notify admins this many days before a site is archived
+$DaysToNotifyBeforeRearchive = 7   # Notify admins this many days before a reactivated unlicensed site is auto-archived again
 $DaysToNotifyBeforeDeletion = 30   # Notify admins this many days before an archived site reaches deletion risk window
 
 ##############################################################
@@ -1577,7 +1593,7 @@ function Add-MilestoneCalculations {
     <#
     .SYNOPSIS
         Enriches a list of unlicensed OneDrive account objects with Day-60 / Day-93
-        milestone dates, days-remaining counters, and a traffic-light urgency label.
+        milestone dates, post-archive risk counters, and a traffic-light urgency label.
     #>
     param (
         [Parameter(Mandatory)] [object[]]$Accounts
@@ -1589,13 +1605,30 @@ function Add-MilestoneCalculations {
         $unlicensedDate = $acct.UnlicensedDate
         $readOnlyDate = $null
         $archiveDate = $null
+        $undiscoverableDate = $null
+        $rearchiveDate = $null
         $daysSinceUnlicensed = $null
         $daysUntilReadOnly = $null
         $daysUntilArchive = $null
+        $daysUntilUndiscoverable = ''
+        $daysUntilRearchive = 'NA - Not Reactivated'
         $rawDaysUntilReadOnly = $null
         $rawDaysUntilArchive = $null
         $daysUntilDeletion = ''
         $urgencyStatus = 'Unknown - No Unlicensed Date'
+        $reportedArchiveStatus = ''
+        $effectiveArchiveStatus = ''
+        $isArchivedByReport = $false
+        $isExplicitlyUnarchivedByReport = $false
+
+        if ($acct.PSObject.Properties['ArchiveStatus'] -and $null -ne $acct.ArchiveStatus) {
+            $reportedArchiveStatus = "$($acct.ArchiveStatus)".Trim()
+        }
+
+        if ($reportedArchiveStatus) {
+            $isArchivedByReport = $reportedArchiveStatus -notin @('None', 'none', 'reactivating', 'unknownFutureValue')
+            $isExplicitlyUnarchivedByReport = $reportedArchiveStatus -in @('None', 'none', 'reactivating', 'unknownFutureValue')
+        }
 
         if ($unlicensedDate) {
             $readOnlyDate = $unlicensedDate.AddDays($script:ReadOnlyThresholdDays)
@@ -1607,15 +1640,27 @@ function Add-MilestoneCalculations {
             # Clamp day counters for report readability while preserving raw values
             # for urgency classification.
             if ($rawDaysUntilArchive -lt 0) {
-                $daysUntilReadOnly = 'Already Archived'
-                $daysUntilArchive = 'Already Archived'
+                if ($isExplicitlyUnarchivedByReport) {
+                    $daysUntilReadOnly = 'Reactivated'
+                    $daysUntilArchive = 'Reactivated'
+                }
+                else {
+                    $daysUntilReadOnly = 'Already Archived'
+                    $daysUntilArchive = 'Already Archived'
+                }
             }
             else {
                 $daysUntilReadOnly = [Math]::Max($rawDaysUntilReadOnly, 0)
                 $daysUntilArchive = [Math]::Max($rawDaysUntilArchive, 0)
             }
 
-            if ($rawDaysUntilArchive -lt 0) {
+            if ($rawDaysUntilArchive -lt 0 -and $isExplicitlyUnarchivedByReport) {
+                $rearchiveDate = $script:today.AddDays($script:RearchiveThresholdDays)
+                $daysUntilRearchive = $script:RearchiveThresholdDays
+                $effectiveArchiveStatus = 'Reactivated'
+                $urgencyStatus = 'REACTIVATED - Unlicensed account will rearchive in 30 days'
+            }
+            elseif ($rawDaysUntilArchive -lt 0) {
                 $urgencyStatus = 'ARCHIVED - Past Day 93'
             }
             elseif ($rawDaysUntilArchive -eq 0) {
@@ -1638,6 +1683,21 @@ function Add-MilestoneCalculations {
             }
             else {
                 $urgencyStatus = 'OK - More than 30 days remaining'
+            }
+        }
+
+        if (-not $effectiveArchiveStatus) {
+            if ($reportedArchiveStatus) {
+                $effectiveArchiveStatus = $reportedArchiveStatus
+            }
+            elseif ($acct.UserSource -eq 'Archived') {
+                $effectiveArchiveStatus = if ($acct.ArchiveStatus) { "$($acct.ArchiveStatus)" } else { 'Archived' }
+            }
+            elseif ($archiveDate -and $script:today -ge $archiveDate.Date) {
+                $effectiveArchiveStatus = 'ShouldBeArchived'
+            }
+            else {
+                $effectiveArchiveStatus = 'NotArchived'
             }
         }
 
@@ -1667,27 +1727,58 @@ function Add-MilestoneCalculations {
             }
 
             if ($paygEnabled) {
+                $daysUntilUndiscoverable = 'NA - PAYG Enabled'
                 $daysUntilDeletion = 'NA - PAYG Enabled'
             }
             else {
                 if ($unlicensedDate) {
+                    $undiscoverableDate = $unlicensedDate.AddDays($script:UndiscoverableThresholdDays)
                     $deletionDate = $unlicensedDate.AddDays($script:ArchiveDeletionThresholdDays)
-                    $rawDaysUntilDeletion = ($deletionDate.Date - $script:today).Days
-                    if ($rawDaysUntilDeletion -lt 0) {
+                    $deletionEnforcementDate = $script:DeletionEnforcementStartDate.Date
+                    $rawDaysUntilUndiscoverable = ($undiscoverableDate.Date - $script:today).Days
+
+                    $effectiveDeletionDate = $deletionDate.Date
+                    if ($effectiveDeletionDate -lt $deletionEnforcementDate) {
+                        $effectiveDeletionDate = $deletionEnforcementDate
+                    }
+                    $rawDaysUntilDeletion = ($effectiveDeletionDate - $script:today).Days
+
+                    if ($rawDaysUntilUndiscoverable -lt 0) {
+                        $daysUntilUndiscoverable = 'Already Undiscoverable'
+                    }
+                    else {
+                        $daysUntilUndiscoverable = $rawDaysUntilUndiscoverable
+                    }
+
+                    if ($script:today -lt $deletionEnforcementDate -and $deletionDate.Date -lt $deletionEnforcementDate) {
+                        $daysUntilDeletion = "Deferred until $($deletionEnforcementDate.ToString('yyyy-MM-dd'))"
+                    }
+                    elseif ($rawDaysUntilDeletion -lt 0) {
                         $daysUntilDeletion = 'Deletion Overdue'
                     }
                     else {
                         $daysUntilDeletion = $rawDaysUntilDeletion
                     }
-                    $urgencyStatus = 'HIGH RISK - Archived, PAYG not enabled'
+
+                    if ($rawDaysUntilUndiscoverable -lt 0) {
+                        $urgencyStatus = 'HIGH RISK - Archived, eDiscovery unavailable'
+                    }
+                    elseif ($rawDaysUntilUndiscoverable -le 30) {
+                        $urgencyStatus = 'HIGH RISK - Archived, eDiscovery risk within 30 days'
+                    }
+                    else {
+                        $urgencyStatus = 'HIGH RISK - Archived, PAYG not enabled'
+                    }
                 }
                 else {
+                    $daysUntilUndiscoverable = 'Unknown - No Unlicensed Date'
                     $daysUntilDeletion = 'Unknown - No Unlicensed Date'
                     $urgencyStatus = 'HIGH RISK - Archived, PAYG unknown date'
                 }
             }
         }
         else {
+            $daysUntilUndiscoverable = 'NA - Not Archived'
             $daysUntilDeletion = 'NA - Not Archived'
         }
 
@@ -1719,8 +1810,13 @@ function Add-MilestoneCalculations {
                 DaysSinceUnlicensed    = $daysSinceUnlicensed
                 ReadOnlyDate           = if ($readOnlyDate) { $readOnlyDate.ToString('yyyy-MM-dd') } else { '' }
                 ArchiveDate            = if ($archiveDate) { $archiveDate.ToString('yyyy-MM-dd') } else { '' }
+                ArchiveStatus          = $effectiveArchiveStatus
+                UndiscoverableDate     = if ($undiscoverableDate) { $undiscoverableDate.ToString('yyyy-MM-dd') } else { '' }
+                RearchiveDate          = if ($rearchiveDate) { $rearchiveDate.ToString('yyyy-MM-dd') } else { '' }
                 DaysUntilReadOnly      = $daysUntilReadOnly
                 DaysUntilArchive       = $daysUntilArchive
+                DaysUntilUndiscoverable = $daysUntilUndiscoverable
+                DaysUntilRearchive     = $daysUntilRearchive
                 DeletionBlockedBy      = if ($acct.PSObject.Properties['DeletionBlockedBy'] -and $acct.DeletionBlockedBy) { $acct.DeletionBlockedBy } else { '' }
                 DaysUntilDeletion      = $daysUntilDeletion
                 UrgencyStatus          = $urgencyStatus
@@ -1760,13 +1856,14 @@ function Write-ConsoleSummary {
     $Records | Group-Object UrgencyStatus | Sort-Object @{
         Expression = {
             switch -Wildcard ($_.Name) {
-                'CRITICAL*' { 1 } 'ARCHIVED*' { 2 } 'WARNING*' { 3 }
-                'MONITOR*' { 4 } 'OK*' { 5 } default { 6 }
+                'CRITICAL*' { 1 } 'REACTIVATED*' { 2 } 'ARCHIVED*' { 3 } 'WARNING*' { 4 }
+                'MONITOR*' { 5 } 'OK*' { 6 } default { 7 }
             }
         }
     } | ForEach-Object {
         $color = switch -Wildcard ($_.Name) {
             'CRITICAL*' { 'Red' }
+            'REACTIVATED*' { 'DarkYellow' }
             'ARCHIVED*' { 'DarkRed' }
             'WARNING*' { 'Yellow' }
             'MONITOR*' { 'Magenta' }
@@ -1850,7 +1947,7 @@ function Send-OneDriveAlertEmail {
     #>
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory)] [ValidateSet('ReadOnly', 'Archive', 'Deletion')] [string]   $NotificationType,
+        [Parameter(Mandatory)] [ValidateSet('ReadOnly', 'Archive', 'Rearchive', 'Deletion')] [string]   $NotificationType,
         [Parameter(Mandatory)] [object[]]                            $AffectedAccounts,
         [Parameter(Mandatory)] [int]                                 $ThresholdDays
     )
@@ -1860,11 +1957,13 @@ function Send-OneDriveAlertEmail {
     $thresholdLabel = switch ($NotificationType) {
         'ReadOnly' { 'Read-Only' }
         'Archive' { 'Archive' }
+        'Rearchive' { 'Rearchive' }
         'Deletion' { 'Deletion' }
     }
     $thresholdDay = switch ($NotificationType) {
         'ReadOnly' { $script:ReadOnlyThresholdDays }
         'Archive' { $script:ArchiveThresholdDays }
+        'Rearchive' { $script:RearchiveThresholdDays }
         'Deletion' { $script:ArchiveDeletionThresholdDays }
     }
 
@@ -1876,6 +1975,7 @@ function Send-OneDriveAlertEmail {
         switch ($NotificationType) {
             'ReadOnly' { $_.DaysUntilReadOnly }
             'Archive' { $_.DaysUntilArchive }
+            'Rearchive' { $_.DaysUntilRearchive }
             'Deletion' { $_.DaysUntilDeletion }
         }
     }
@@ -1884,17 +1984,23 @@ function Send-OneDriveAlertEmail {
         $daysRemaining = switch ($NotificationType) {
             'ReadOnly' { $acct.DaysUntilReadOnly }
             'Archive' { $acct.DaysUntilArchive }
+            'Rearchive' { $acct.DaysUntilRearchive }
             'Deletion' { $acct.DaysUntilDeletion }
         }
         $targetDate = switch ($NotificationType) {
             'ReadOnly' { $acct.ReadOnlyDate }
             'Archive' { $acct.ArchiveDate }
+            'Rearchive' { $acct.RearchiveDate }
             'Deletion' {
                 $deletionDateText = ''
                 if ($acct.UnlicensedDate) {
                     try {
                         $parsedUnlicensedDate = [datetime]::Parse($acct.UnlicensedDate)
-                        $deletionDateText = $parsedUnlicensedDate.AddDays($script:ArchiveDeletionThresholdDays).ToString('yyyy-MM-dd')
+                        $computedDeletionDate = $parsedUnlicensedDate.AddDays($script:ArchiveDeletionThresholdDays).Date
+                        if ($computedDeletionDate -lt $script:DeletionEnforcementStartDate.Date) {
+                            $computedDeletionDate = $script:DeletionEnforcementStartDate.Date
+                        }
+                        $deletionDateText = $computedDeletionDate.ToString('yyyy-MM-dd')
                     }
                     catch {}
                 }
@@ -1924,11 +2030,13 @@ function Send-OneDriveAlertEmail {
     $headerColor = switch ($NotificationType) {
         'ReadOnly' { '#1a5276' }
         'Archive' { '#7b241c' }
+        'Rearchive' { '#9a7d0a' }
         'Deletion' { '#922b21' }
     }
     $alertHeading = switch ($NotificationType) {
         'ReadOnly' { "OneDrive Read-Only Alert — $($AffectedAccounts.Count) account(s) go read-only within $ThresholdDays day(s)" }
         'Archive' { "OneDrive Archive Alert — $($AffectedAccounts.Count) account(s) will be archived within $ThresholdDays day(s)" }
+        'Rearchive' { "OneDrive Rearchive Alert — $($AffectedAccounts.Count) account(s) will be auto-archived again within $ThresholdDays day(s)" }
         'Deletion' { "OneDrive Deletion Risk Alert — $($AffectedAccounts.Count) account(s) reach deletion risk window within $ThresholdDays day(s)" }
     }
 
@@ -2018,7 +2126,7 @@ Write-Host '  Multi-geo: all geos covered by single Graph token' -ForegroundColo
 Write-Host ("  Run date : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -ForegroundColor Cyan
 Write-Host '======================================================' -ForegroundColor Cyan
 Write-Host ''
-Write-Host ("Timeline  : Day {0} = Read-Only  |  Day {1} = Archived/Deleted" -f $ReadOnlyThresholdDays, $ArchiveThresholdDays) -ForegroundColor White
+Write-Host ("Timeline  : Day {0} = Read-Only  |  Day {1} = Archived  |  Day {2} = Undiscoverable (no PAYG)  |  Day {3} = Deletion risk" -f $ReadOnlyThresholdDays, $ArchiveThresholdDays, $UndiscoverableThresholdDays, $ArchiveDeletionThresholdDays) -ForegroundColor White
 Write-Host ''
 
 # Step 1: Authenticate — single Graph token, covers all geo datacenters
@@ -2261,6 +2369,26 @@ if ($IncludeDownloadedRowsInMainReport -and $global:spoDownloadedReportRows.Coun
             if (-not $match.UserPrincipalName -and $dl.UserPrincipalName) { $match.UserPrincipalName = $dl.UserPrincipalName; $changed = $true }
             if (-not $match.UnlicensedDate -and $dl.UnlicensedDate) { $match.UnlicensedDate = $dl.UnlicensedDate; $changed = $true }
             if ((-not $match.UnlicensedDueTo -or $match.UnlicensedDueTo -eq 'Unknown from SPO export') -and $dl.UnlicensedDueTo) { $match.UnlicensedDueTo = $dl.UnlicensedDueTo; $changed = $true }
+            if ($dl.PSObject.Properties['ArchiveStatus']) {
+                if ($match.PSObject.Properties['ArchiveStatus']) {
+                    if ($match.ArchiveStatus -ne $dl.ArchiveStatus) {
+                        $match.ArchiveStatus = $dl.ArchiveStatus
+                        $changed = $true
+                    }
+                }
+                else {
+                    $match | Add-Member -NotePropertyName 'ArchiveStatus' -NotePropertyValue $dl.ArchiveStatus -Force
+                    $changed = $true
+                }
+            }
+            if ($dl.UserSource -and $match.UserSource -ne $dl.UserSource) {
+                $match.UserSource = $dl.UserSource
+                $changed = $true
+            }
+            if ($null -ne $dl.AccountEnabled -and $match.AccountEnabled -ne $dl.AccountEnabled) {
+                $match.AccountEnabled = $dl.AccountEnabled
+                $changed = $true
+            }
             if ($dl.DeletionBlockedBy) {
                 if ($match.PSObject.Properties['DeletionBlockedBy']) {
                     if (-not $match.DeletionBlockedBy) {
@@ -2302,8 +2430,8 @@ if ($global:tenantPayGStatus -and $global:tenantPayGStatus.DetectionMode) {
     Write-Host "  PAYG detection mode: $($global:tenantPayGStatus.DetectionMode)" -ForegroundColor Gray
 }
 
-# Step 7 (Phase 5): Enrich with Day-$ReadOnlyThresholdDays / Day-$ArchiveThresholdDays milestones
-Write-Host "`nPhase 5: Calculating Day-$ReadOnlyThresholdDays / Day-$ArchiveThresholdDays milestones..." -ForegroundColor Cyan
+# Step 7 (Phase 5): Enrich with milestone and post-archive risk dates.
+Write-Host "`nPhase 5: Calculating Day-$ReadOnlyThresholdDays / Day-$ArchiveThresholdDays / Day-$UndiscoverableThresholdDays milestones..." -ForegroundColor Cyan
 $enriched = if ($confirmedUnlicensed.Count -gt 0) {
     Add-MilestoneCalculations -Accounts $confirmedUnlicensed
 }
@@ -2314,8 +2442,8 @@ $sorted = $enriched | Sort-Object @(
     @{
         Expression = {
             switch -Wildcard ($_.UrgencyStatus) {
-                'CRITICAL*' { 1 } 'ARCHIVED*' { 2 } 'WARNING*' { 3 }
-                'MONITOR*' { 4 } 'OK*' { 5 } default { 6 }
+                'CRITICAL*' { 1 } 'REACTIVATED*' { 2 } 'ARCHIVED*' { 3 } 'WARNING*' { 4 }
+                'MONITOR*' { 5 } 'OK*' { 6 } default { 7 }
             }
         }
     },
@@ -2367,6 +2495,16 @@ if ($SendEmailNotifications) {
         # Deletion risk alert — archived accounts approaching deletion-risk threshold.
         # Only numeric day counters are included; text values such as
         # 'NA - PAYG Enabled' or 'Unknown - No Unlicensed Date' are excluded.
+        $rearchiveAlert = @($sorted | Where-Object {
+            $daysUntilRearchive = $_.DaysUntilRearchive -as [int]
+            $null -ne $daysUntilRearchive -and
+            $daysUntilRearchive -ge 0 -and
+            $daysUntilRearchive -le $DaysToNotifyBeforeRearchive
+            })
+
+        # Deletion risk alert — archived accounts approaching deletion-risk threshold.
+        # Only numeric day counters are included; text values such as
+        # 'NA - PAYG Enabled' or 'Unknown - No Unlicensed Date' are excluded.
         $deletionAlert = @($sorted | Where-Object {
                 $daysUntilDeletion = $_.DaysUntilDeletion -as [int]
                 $null -ne $daysUntilDeletion -and
@@ -2388,6 +2526,14 @@ if ($SendEmailNotifications) {
         }
         else {
             Write-Host "  Archive alert  : No accounts within $DaysToNotifyBeforeArchive day(s) of archive — email skipped." -ForegroundColor Gray
+        }
+
+        if ($rearchiveAlert.Count -gt 0) {
+            Write-Host "  Rearchive alert: $($rearchiveAlert.Count) account(s) within $DaysToNotifyBeforeRearchive day(s) of rearchive." -ForegroundColor Yellow
+            Send-OneDriveAlertEmail -NotificationType Rearchive -AffectedAccounts $rearchiveAlert -ThresholdDays $DaysToNotifyBeforeRearchive
+        }
+        else {
+            Write-Host "  Rearchive alert: No accounts within $DaysToNotifyBeforeRearchive day(s) of rearchive — email skipped." -ForegroundColor Gray
         }
 
         if ($deletionAlert.Count -gt 0) {
