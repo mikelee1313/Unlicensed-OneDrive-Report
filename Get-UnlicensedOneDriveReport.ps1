@@ -61,6 +61,8 @@
     - Merged the download functionality with the existing report generation.
     Date: 6/12/26
     - Added throttling for Audit Queries
+    Date: 9/8/26
+    - Added support to collect LockState for archived OneDrive sites (Unlock, ReadOnly, NoAccess, NoAdditions)
     
 
     Required Microsoft Graph App Permissions (Application type):
@@ -161,6 +163,7 @@ $GetCurrentlyArchived = $true
 
 # Primary source for archived accounts:
 #   'SPODownload' (recommended): SharePoint Admin ExportToCSV download.
+#   'GraphSites': Microsoft Graph beta getAllSites enumeration.
 #   NOTE: Requires Certificate authentication. ClientSecret is not supported.
 $ArchivedCollectionMode = 'SPODownload'
 
@@ -182,6 +185,12 @@ $MergeDownloadedSPOReports = $true
 # When $true, rows from downloaded SPO reports are used to backfill/add records
 # in the final report (useful when audit lookup does not return dates or users).
 $IncludeDownloadedRowsInMainReport = $true
+
+# ---- Site LockState ----
+# When $true, queries each discovered site's LockState (Unlock, ReadOnly, NoAccess,
+# NoAdditions) via the same SPO admin REST/certificate auth already used for the
+# SPO export (no PnP/SPO PowerShell module required).
+$IncludeLockState = $true
 
 # ---- Request throttling ----
 $MaxRetries = 15
@@ -288,8 +297,9 @@ function Invoke-GraphRequestWithThrottleHandling {
         [Parameter(Mandatory)] [string]   $Uri,
         [Parameter(Mandatory)] [string]   $Method,
         [Parameter()]          [hashtable] $Headers = @{},
-        [Parameter()]          [string]    $Body = $null,
+        [Parameter()]          [object]    $Body = $null,
         [Parameter()]          [string]    $ContentType = 'application/json',
+        [Parameter()]          [string]    $OutFile,
         [Parameter()]          [int]      $MaxRetries = $script:MaxRetries,
         [Parameter()]          [int]      $InitialBackoffSeconds = $script:InitialBackoffSec,
         [Parameter()]          [int]      $TimeoutSeconds = $script:RequestTimeoutSec
@@ -312,9 +322,15 @@ function Invoke-GraphRequestWithThrottleHandling {
                 ErrorAction = 'Stop'
                 Verbose     = $false
             }
-            if ($Body) { $invokeParams['Body'] = $Body }
+            if ($null -ne $Body) { $invokeParams['Body'] = $Body }
 
-            $result = Invoke-RestMethod @invokeParams
+            if ($PSBoundParameters.ContainsKey('OutFile')) {
+                $invokeParams['OutFile'] = $OutFile
+                $result = Invoke-WebRequest @invokeParams
+            }
+            else {
+                $result = Invoke-RestMethod @invokeParams
+            }
             return $result
         }
         catch {
@@ -323,11 +339,14 @@ function Invoke-GraphRequestWithThrottleHandling {
                 $statusCode = [int]$_.Exception.Response.StatusCode
             }
 
-            $isRetryable = $statusCode -in @(429, 502, 503, 504) -or
-            $_.Exception -is [System.Net.WebException] -and (
+            $isLegacyNetworkFailure = $_.Exception -is [System.Net.WebException] -and (
                 $_.Exception.Status -eq [System.Net.WebExceptionStatus]::Timeout -or
                 $_.Exception.Status -eq [System.Net.WebExceptionStatus]::ConnectionClosed
             )
+            $isModernTimeout = $_.Exception -is [System.Threading.Tasks.TaskCanceledException] -or
+            $_.Exception -is [System.TimeoutException] -or
+            $_.Exception.InnerException -is [System.TimeoutException]
+            $isRetryable = $statusCode -in @(429, 502, 503, 504) -or $isLegacyNetworkFailure -or $isModernTimeout
 
             if (-not $isRetryable) { throw $_ }
 
@@ -518,8 +537,8 @@ function AcquireToken {
     }
 
     try {
-        $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-            -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
+        $resp = Invoke-GraphRequestWithThrottleHandling -Method POST -Uri $tokenUri -Body $body `
+            -ContentType 'application/x-www-form-urlencoded'
         $global:token = $resp.access_token
         $expiresIn = if ($resp.expires_in) { $resp.expires_in } else { 3600 }
         $global:tokenExpiry = (Get-Date).AddSeconds($expiresIn - 300)
@@ -614,8 +633,8 @@ function Get-SPOTokenForAdminUrl {
     }
 
     try {
-        $resp = Invoke-RestMethod -Method Post -Uri $tokenUri -Body $body `
-            -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -Verbose:$false
+        $resp = Invoke-GraphRequestWithThrottleHandling -Method POST -Uri $tokenUri -Body $body `
+            -ContentType 'application/x-www-form-urlencoded'
 
         $expiresIn = if ($resp.expires_in) { [int]$resp.expires_in } else { 3600 }
         $expiry = (Get-Date).AddSeconds($expiresIn - 300)
@@ -834,16 +853,68 @@ function Get-LicenseChangeDates {
         }
     }
 
-    function Test-HasLicenseRelatedModifiedProperty {
+    function Get-EnabledRelevantPlanIds {
+        param (
+            [Parameter()] [object]$Value
+        )
+
+        $planIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+        function Add-PlanIdsFromValue {
+            param ([object]$Node)
+
+            if ($null -eq $Node) { return }
+            if ($Node -is [string]) {
+                if ([string]::IsNullOrWhiteSpace($Node)) { return }
+                try {
+                    Add-PlanIdsFromValue -Node ($Node | ConvertFrom-Json -ErrorAction Stop)
+                }
+                catch {
+                    foreach ($knownPlanId in $script:AllOneDrivePlanIds) {
+                        if ($Node.IndexOf($knownPlanId, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            $planIds.Add($knownPlanId) | Out-Null
+                        }
+                    }
+                }
+                return
+            }
+            if ($Node -is [System.ValueType]) { return }
+            if ($Node -is [System.Collections.IEnumerable]) {
+                foreach ($item in $Node) { Add-PlanIdsFromValue -Node $item }
+                return
+            }
+
+            $idProperty = $Node.PSObject.Properties | Where-Object { $_.Name -ieq 'servicePlanId' } | Select-Object -First 1
+            $statusProperty = $Node.PSObject.Properties | Where-Object { $_.Name -ieq 'capabilityStatus' } | Select-Object -First 1
+            if ($idProperty -and $script:AllOneDrivePlanIds.Contains([string]$idProperty.Value) -and
+                (-not $statusProperty -or [string]$statusProperty.Value -ieq 'Enabled')) {
+                $planIds.Add([string]$idProperty.Value) | Out-Null
+            }
+
+            foreach ($property in $Node.PSObject.Properties) {
+                Add-PlanIdsFromValue -Node $property.Value
+            }
+        }
+
+        Add-PlanIdsFromValue -Node $Value
+        return ,$planIds
+    }
+
+    function Test-HasOneDrivePlanRemoval {
         param (
             [Parameter(Mandatory)] [object]$TargetResource
         )
 
         foreach ($modifiedProperty in $TargetResource.modifiedProperties) {
-            if (-not $modifiedProperty.displayName) { continue }
-            $propertyName = [string]$modifiedProperty.displayName
-            if ($propertyName -match 'assignedlicenses|assignedplans|license|serviceplan') {
-                return $true
+            if (-not $modifiedProperty.displayName -or
+                [string]$modifiedProperty.displayName -notmatch 'assignedlicenses|assignedplans|license|serviceplan') {
+                continue
+            }
+
+            $oldPlanIds = Get-EnabledRelevantPlanIds -Value $modifiedProperty.oldValue
+            $newPlanIds = Get-EnabledRelevantPlanIds -Value $modifiedProperty.newValue
+            foreach ($oldPlanId in $oldPlanIds) {
+                if (-not $newPlanIds.Contains($oldPlanId)) { return $true }
             }
         }
 
@@ -858,10 +929,10 @@ function Get-LicenseChangeDates {
     # removal as 'Update user', so treat that as a match only when license-related
     # properties were modified on the target user resource.
     $activityFilters = @(
-        @{ Name = 'Change user license'; RequiresLicensePropertyMatch = $false; UseSlimSelect = $true },
-        @{ Name = 'Finish applying group based license to user'; RequiresLicensePropertyMatch = $false; UseSlimSelect = $true },
-        @{ Name = 'Remove user from licensed group'; RequiresLicensePropertyMatch = $false; UseSlimSelect = $true },
-        @{ Name = 'Update user'; RequiresLicensePropertyMatch = $true; UseSlimSelect = $false }
+        @{ Name = 'Change user license'; UseSlimSelect = $false },
+        @{ Name = 'Finish applying group based license to user'; UseSlimSelect = $false },
+        @{ Name = 'Remove user from licensed group'; UseSlimSelect = $false },
+        @{ Name = 'Update user'; UseSlimSelect = $false }
     )
     $eventCount = 0
     $queryFailed = $false
@@ -935,7 +1006,7 @@ function Get-LicenseChangeDates {
                     foreach ($target in $auditEvent.targetResources) {
                         if (-not $target.id) { continue }
                         if (-not $TargetUserIds.Contains($target.id)) { continue }
-                        if ($activityFilter.RequiresLicensePropertyMatch -and -not (Test-HasLicenseRelatedModifiedProperty -TargetResource $target)) {
+                        if (-not (Test-HasOneDrivePlanRemoval -TargetResource $target)) {
                             continue
                         }
                         if (-not $lookupTable.ContainsKey($target.id) -or $eventDate -gt $lookupTable[$target.id]) {
@@ -1166,6 +1237,7 @@ function Get-ArchivedOneDriveSites {
                         UnlicensedDate    = $null    # Date unavailable — predates Entra purge (>30 days ago)
                         UnlicensedDueTo   = 'OneDrive archived by Microsoft'
                         ArchiveStatus     = $archStatus
+                        LockState         = ''    # Not exposed by Graph — see SPO export backfill for LockState
                         DriveInfo         = $driveInfo
                     })
             }
@@ -1232,6 +1304,7 @@ function Get-ArchivedOneDriveSites {
                             UnlicensedDate    = $null
                             UnlicensedDueTo   = 'OneDrive archived by Microsoft'
                             ArchiveStatus     = 'archived'
+                            LockState         = 'Locked (HTTP 423)'
                             DriveInfo         = [PSCustomObject]@{
                                 Found             = $true
                                 DriveId           = ''
@@ -1275,6 +1348,7 @@ function Get-ArchivedOneDriveSites {
                     UnlicensedDate    = $null    # Date unavailable — predates Entra purge (>30 days ago)
                     UnlicensedDueTo   = 'OneDrive archived by Microsoft'
                     ArchiveStatus     = $archStatus
+                    LockState         = ''    # Not exposed by Graph — see SPO export backfill for LockState
                     DriveInfo         = $driveInfo
                 })
         }
@@ -1284,7 +1358,7 @@ function Get-ArchivedOneDriveSites {
     return $archivedSites
 }
 
-function Download-UnlicensedOneDriveCsvFromSPO {
+function Export-UnlicensedOneDriveCsvFromSPO {
     <#
     .SYNOPSIS
         Downloads the same unlicensed OneDrive CSV report exposed by
@@ -1407,7 +1481,7 @@ function Download-UnlicensedOneDriveCsvFromSPO {
     $tenantLabel = if ($AdminUrl -match 'https://([^-]+)-admin\.sharepoint\.com') { $matches[1] } else { $AdminUrl -replace 'https?://' }
     $localFile = Join-Path $OutputPath "UnlicensedOneDrive_${tenantLabel}_$fileName"
 
-    Invoke-WebRequest -Uri $csvUrl -Headers $downloadHeaders -OutFile $localFile -UseBasicParsing -ErrorAction Stop
+    Invoke-GraphRequestWithThrottleHandling -Uri $csvUrl -Method GET -Headers $downloadHeaders -OutFile $localFile | Out-Null
     Write-Host "  SPO report downloaded: $localFile" -ForegroundColor Green
     return $localFile
 }
@@ -1438,6 +1512,9 @@ function Convert-SPOCsvToReportAccounts {
         $unlicensedOnRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('UNLICENSED_ON', 'Unlicensed on', 'UnlicensedOdbStartDate')
         $deletionBlockedByRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('DELETION_BLOCK_REASON', 'Deletion blocked by', 'UnlicensedOdbCleanupBlockReason')
         $deletionBlockedBy = if ($deletionBlockedByRaw) { "$deletionBlockedByRaw".Trim() } else { '' }
+        $deletionScheduledOnRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('DELETION_SCHEDULED_ON', 'Deletion scheduled on', 'UnlicensedOdbToBeDeletedOn')
+        $lockStateRaw = Get-ObjectPropertyValue -InputObject $row -CandidateNames @('LOCK_STATE', 'Lock state', 'LockState')
+        $lockState = if ($lockStateRaw) { "$lockStateRaw".Trim() } else { '' }
 
         if (-not $upn -and $url) {
             $upn = ConvertTo-UPNFromSiteUrl -SiteUrl "$url"
@@ -1466,6 +1543,10 @@ function Convert-SPOCsvToReportAccounts {
         if ($unlicensedOnRaw) {
             try { $unlicensedDate = [datetime]::Parse("$unlicensedOnRaw") } catch {}
         }
+        $deletionScheduledOn = $null
+        if ($deletionScheduledOnRaw) {
+            try { $deletionScheduledOn = [datetime]::Parse("$deletionScheduledOnRaw") } catch {}
+        }
 
         $userSource = 'Active'
         $accountEnabled = $true
@@ -1480,6 +1561,7 @@ function Convert-SPOCsvToReportAccounts {
 
         $noteParts = [System.Collections.Generic.List[string]]::new()
         if ($archiveStatus) { $noteParts.Add("archiveStatus: $archiveStatus") | Out-Null }
+        if ($lockState) { $noteParts.Add("lockState: $lockState") | Out-Null }
         if ($unlicensedReason) { $noteParts.Add("Reason: $unlicensedReason") | Out-Null }
         if ($deletionBlockedBy) { $noteParts.Add("DeletionBlockedBy: $deletionBlockedBy") | Out-Null }
         $noteParts.Add('Source=SPO ExportToCSV') | Out-Null
@@ -1495,7 +1577,9 @@ function Convert-SPOCsvToReportAccounts {
                 UnlicensedDate    = $unlicensedDate
                 UnlicensedDueTo   = if ($unlicensedReason) { "$unlicensedReason" } else { 'Unknown from SPO export' }
                 DeletionBlockedBy = $deletionBlockedBy
+                DeletionScheduledOn = $deletionScheduledOn
                 ArchiveStatus     = "$archiveStatus"
+                LockState         = $lockState
                 DriveInfo         = [PSCustomObject]@{
                     Found             = $true
                     DriveId           = ''
@@ -1555,7 +1639,7 @@ function Get-ArchivedOneDriveSitesFromSPOExport {
     foreach ($adminUrl in $SPOAdminUrls) {
         try {
             Write-Host "  SPO export: $adminUrl" -ForegroundColor Gray
-            $csvPath = Download-UnlicensedOneDriveCsvFromSPO -AdminUrl $adminUrl -OutputPath $OutputFolder
+            $csvPath = Export-UnlicensedOneDriveCsvFromSPO -AdminUrl $adminUrl -OutputPath $OutputFolder
             $global:spoDownloadedReportFiles.Add($csvPath) | Out-Null
 
             $rawRows = Import-Csv -Path $csvPath
@@ -1585,6 +1669,89 @@ function Get-ArchivedOneDriveSitesFromSPOExport {
     return $fromCsv
 }
 
+function Get-SiteLockStatesViaSPORest {
+    <#
+    .SYNOPSIS
+        Builds a lookup table of OneDrive site URL -> LockState (Unlock/ReadOnly/NoAccess/NoAdditions)
+        using the SPO.Tenant CSOM-proxy REST endpoint (_api/SPO.Tenant/GetSitePropertiesByUrl) —
+        the same REST surface already used for ExportToCSV, so no PnP/SPO PowerShell module is needed.
+    .OUTPUTS
+        Hashtable keyed by normalized (trimmed, lowercased, trailing-slash-removed) site URL.
+    #>
+    param (
+        [Parameter(Mandatory)] [string[]]$SiteUrls
+    )
+
+    $lockStates = @{}
+    $uniqueUrls = @($SiteUrls | Where-Object { $_ } | Select-Object -Unique)
+    if ($uniqueUrls.Count -eq 0 -or -not $SPOAdminUrls -or $SPOAdminUrls.Count -eq 0) { return $lockStates }
+
+    foreach ($adminUrl in $SPOAdminUrls) {
+        $postHeaders = $null
+        $contextRefreshAt = [datetime]::MinValue
+        $contextUnavailable = $false
+        $resolved = 0
+        foreach ($siteUrl in $uniqueUrls) {
+            $key = $siteUrl.TrimEnd('/').ToLowerInvariant()
+            if ($lockStates.ContainsKey($key)) { continue }   # already resolved via an earlier admin URL
+
+            if (-not $postHeaders -or (Get-Date) -ge $contextRefreshAt) {
+                try {
+                    $spoToken = Get-SPOTokenForAdminUrl -AdminUrl $adminUrl
+                    $contextHeaders = @{ Authorization = "Bearer $spoToken"; Accept = 'application/json;odata=verbose' }
+                    $contextInfo = Invoke-GraphRequestWithThrottleHandling -Uri "$adminUrl/_api/contextinfo" -Method POST -Headers $contextHeaders -ContentType 'application/json;odata=verbose'
+                    $contextDetails = $contextInfo.d.GetContextWebInformation
+                    if (-not $contextDetails.FormDigestValue) { throw 'SPO context response did not contain a form digest.' }
+
+                    $digestTimeoutSec = 1800
+                    if ($contextDetails.FormDigestTimeoutSeconds) {
+                        $digestTimeoutSec = [int]$contextDetails.FormDigestTimeoutSeconds
+                    }
+                    $refreshAfterSec = [Math]::Max(60, [Math]::Min(1200, $digestTimeoutSec - 300))
+                    $contextRefreshAt = (Get-Date).AddSeconds($refreshAfterSec)
+                    $postHeaders = @{
+                        Authorization     = "Bearer $spoToken"
+                        Accept            = 'application/json;odata=verbose'
+                        'X-RequestDigest' = $contextDetails.FormDigestValue
+                        'odata-version'   = '4.0'
+                    }
+                }
+                catch {
+                    Write-Host "  LockState: could not acquire SPO context for ${adminUrl}: $($_.Exception.Message)" -ForegroundColor Yellow
+                    $contextUnavailable = $true
+                    break
+                }
+            }
+
+            $reqBody = @{ url = $siteUrl; includeDetail = $true } | ConvertTo-Json -Compress
+
+            try {
+                $resp = Invoke-GraphRequestWithThrottleHandling -Uri "$adminUrl/_api/SPO.Tenant/GetSitePropertiesByUrl" -Method POST -Headers $postHeaders -Body $reqBody -ContentType 'application/json;odata=verbose;charset=utf-8'
+                $props = if ($resp.d -and $resp.d.GetSitePropertiesByUrl) { $resp.d.GetSitePropertiesByUrl } elseif ($resp.GetSitePropertiesByUrl) { $resp.GetSitePropertiesByUrl } else { $resp }
+                if ($props -and $props.LockState) {
+                    $lockStates[$key] = "$($props.LockState)"
+                    $resolved++
+                }
+            }
+            catch {
+                if ($debug) { Write-Host "  LockState lookup failed for ${siteUrl} after retries: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+            }
+        }
+
+        Write-Host "  LockState lookup via ${adminUrl}: $resolved of $($uniqueUrls.Count) sites resolved." -ForegroundColor Gray
+        if ($contextUnavailable) { continue }
+    }
+
+    $unresolvedCount = @($uniqueUrls | Where-Object {
+            -not $lockStates.ContainsKey($_.TrimEnd('/').ToLowerInvariant())
+        }).Count
+    if ($unresolvedCount -gt 0) {
+        Write-Host "  LockState warning: $unresolvedCount of $($uniqueUrls.Count) sites could not be resolved after retries across the configured SPO admin URLs." -ForegroundColor Yellow
+    }
+
+    return $lockStates
+}
+
 #endregion Data Collection Functions
 
 #region Enrichment Functions
@@ -1607,6 +1774,7 @@ function Add-MilestoneCalculations {
         $archiveDate = $null
         $undiscoverableDate = $null
         $rearchiveDate = $null
+        $deletionDate = $null
         $daysSinceUnlicensed = $null
         $daysUntilReadOnly = $null
         $daysUntilArchive = $null
@@ -1618,16 +1786,20 @@ function Add-MilestoneCalculations {
         $urgencyStatus = 'Unknown - No Unlicensed Date'
         $reportedArchiveStatus = ''
         $effectiveArchiveStatus = ''
-        $isArchivedByReport = $false
         $isExplicitlyUnarchivedByReport = $false
+        $isArchiveStatusUnknown = $false
 
         if ($acct.PSObject.Properties['ArchiveStatus'] -and $null -ne $acct.ArchiveStatus) {
             $reportedArchiveStatus = "$($acct.ArchiveStatus)".Trim()
         }
 
         if ($reportedArchiveStatus) {
-            $isArchivedByReport = $reportedArchiveStatus -notin @('None', 'none', 'reactivating', 'unknownFutureValue')
-            $isExplicitlyUnarchivedByReport = $reportedArchiveStatus -in @('None', 'none', 'reactivating', 'unknownFutureValue')
+            $isExplicitlyUnarchivedByReport = $reportedArchiveStatus -in @('None', 'reactivating')
+            $isArchiveStatusUnknown = $reportedArchiveStatus -eq 'unknownFutureValue'
+        }
+
+        if ($acct.PSObject.Properties['DeletionScheduledOn'] -and $acct.DeletionScheduledOn) {
+            try { $deletionDate = [datetime]::Parse([string]$acct.DeletionScheduledOn) } catch {}
         }
 
         if ($unlicensedDate) {
@@ -1640,7 +1812,11 @@ function Add-MilestoneCalculations {
             # Clamp day counters for report readability while preserving raw values
             # for urgency classification.
             if ($rawDaysUntilArchive -lt 0) {
-                if ($isExplicitlyUnarchivedByReport) {
+                if ($isArchiveStatusUnknown) {
+                    $daysUntilReadOnly = 'Unknown - Archive Status'
+                    $daysUntilArchive = 'Unknown - Archive Status'
+                }
+                elseif ($isExplicitlyUnarchivedByReport) {
                     $daysUntilReadOnly = 'Reactivated'
                     $daysUntilArchive = 'Reactivated'
                 }
@@ -1654,11 +1830,14 @@ function Add-MilestoneCalculations {
                 $daysUntilArchive = [Math]::Max($rawDaysUntilArchive, 0)
             }
 
-            if ($rawDaysUntilArchive -lt 0 -and $isExplicitlyUnarchivedByReport) {
-                $rearchiveDate = $script:today.AddDays($script:RearchiveThresholdDays)
-                $daysUntilRearchive = $script:RearchiveThresholdDays
+            if ($rawDaysUntilArchive -lt 0 -and $isArchiveStatusUnknown) {
+                $effectiveArchiveStatus = 'unknownFutureValue'
+                $urgencyStatus = 'UNKNOWN - Archive status not recognized'
+            }
+            elseif ($rawDaysUntilArchive -lt 0 -and $isExplicitlyUnarchivedByReport) {
+                $daysUntilRearchive = 'Unknown - Reactivation date unavailable'
                 $effectiveArchiveStatus = 'Reactivated'
-                $urgencyStatus = 'REACTIVATED - Unlicensed account will rearchive in 30 days'
+                $urgencyStatus = 'REACTIVATED - Rearchive date unavailable'
             }
             elseif ($rawDaysUntilArchive -lt 0) {
                 $urgencyStatus = 'ARCHIVED - Past Day 93'
@@ -1733,31 +1912,13 @@ function Add-MilestoneCalculations {
             else {
                 if ($unlicensedDate) {
                     $undiscoverableDate = $unlicensedDate.AddDays($script:UndiscoverableThresholdDays)
-                    $deletionDate = $unlicensedDate.AddDays($script:ArchiveDeletionThresholdDays)
-                    $deletionEnforcementDate = $script:DeletionEnforcementStartDate.Date
                     $rawDaysUntilUndiscoverable = ($undiscoverableDate.Date - $script:today).Days
-
-                    $effectiveDeletionDate = $deletionDate.Date
-                    if ($effectiveDeletionDate -lt $deletionEnforcementDate) {
-                        $effectiveDeletionDate = $deletionEnforcementDate
-                    }
-                    $rawDaysUntilDeletion = ($effectiveDeletionDate - $script:today).Days
 
                     if ($rawDaysUntilUndiscoverable -lt 0) {
                         $daysUntilUndiscoverable = 'Already Undiscoverable'
                     }
                     else {
                         $daysUntilUndiscoverable = $rawDaysUntilUndiscoverable
-                    }
-
-                    if ($script:today -lt $deletionEnforcementDate -and $deletionDate.Date -lt $deletionEnforcementDate) {
-                        $daysUntilDeletion = "Deferred until $($deletionEnforcementDate.ToString('yyyy-MM-dd'))"
-                    }
-                    elseif ($rawDaysUntilDeletion -lt 0) {
-                        $daysUntilDeletion = 'Deletion Overdue'
-                    }
-                    else {
-                        $daysUntilDeletion = $rawDaysUntilDeletion
                     }
 
                     if ($rawDaysUntilUndiscoverable -lt 0) {
@@ -1772,8 +1933,31 @@ function Add-MilestoneCalculations {
                 }
                 else {
                     $daysUntilUndiscoverable = 'Unknown - No Unlicensed Date'
-                    $daysUntilDeletion = 'Unknown - No Unlicensed Date'
                     $urgencyStatus = 'HIGH RISK - Archived, PAYG unknown date'
+                }
+
+                if ($deletionDate) {
+                    $rawDaysUntilDeletion = ($deletionDate.Date - $script:today).Days
+                    $daysUntilDeletion = if ($rawDaysUntilDeletion -lt 0) { 'Deletion Overdue' } else { $rawDaysUntilDeletion }
+                }
+                elseif ($unlicensedDate) {
+                    $calculatedDeletionDate = $unlicensedDate.AddDays($script:ArchiveDeletionThresholdDays).Date
+                    $deletionEnforcementDate = $script:DeletionEnforcementStartDate.Date
+                    $deletionDate = if ($calculatedDeletionDate -lt $deletionEnforcementDate) { $deletionEnforcementDate } else { $calculatedDeletionDate }
+                    $rawDaysUntilDeletion = ($deletionDate.Date - $script:today).Days
+
+                    if ($script:today -lt $deletionEnforcementDate -and $calculatedDeletionDate -lt $deletionEnforcementDate) {
+                        $daysUntilDeletion = "Deferred until $($deletionEnforcementDate.ToString('yyyy-MM-dd'))"
+                    }
+                    elseif ($rawDaysUntilDeletion -lt 0) {
+                        $daysUntilDeletion = 'Deletion Overdue'
+                    }
+                    else {
+                        $daysUntilDeletion = $rawDaysUntilDeletion
+                    }
+                }
+                else {
+                    $daysUntilDeletion = 'Unknown - No Deletion Date'
                 }
             }
         }
@@ -1811,6 +1995,7 @@ function Add-MilestoneCalculations {
                 ReadOnlyDate           = if ($readOnlyDate) { $readOnlyDate.ToString('yyyy-MM-dd') } else { '' }
                 ArchiveDate            = if ($archiveDate) { $archiveDate.ToString('yyyy-MM-dd') } else { '' }
                 ArchiveStatus          = $effectiveArchiveStatus
+                LockState              = if ($acct.PSObject.Properties['LockState'] -and $acct.LockState) { "$($acct.LockState)" } else { '' }
                 UndiscoverableDate     = if ($undiscoverableDate) { $undiscoverableDate.ToString('yyyy-MM-dd') } else { '' }
                 RearchiveDate          = if ($rearchiveDate) { $rearchiveDate.ToString('yyyy-MM-dd') } else { '' }
                 DaysUntilReadOnly      = $daysUntilReadOnly
@@ -1818,6 +2003,7 @@ function Add-MilestoneCalculations {
                 DaysUntilUndiscoverable = $daysUntilUndiscoverable
                 DaysUntilRearchive     = $daysUntilRearchive
                 DeletionBlockedBy      = if ($acct.PSObject.Properties['DeletionBlockedBy'] -and $acct.DeletionBlockedBy) { $acct.DeletionBlockedBy } else { '' }
+                DeletionDate           = if ($deletionDate) { $deletionDate.ToString('yyyy-MM-dd') } else { '' }
                 DaysUntilDeletion      = $daysUntilDeletion
                 UrgencyStatus          = $urgencyStatus
                 StorageUsedGB          = $driveInfo.StorageUsedGB
@@ -1991,21 +2177,7 @@ function Send-OneDriveAlertEmail {
             'ReadOnly' { $acct.ReadOnlyDate }
             'Archive' { $acct.ArchiveDate }
             'Rearchive' { $acct.RearchiveDate }
-            'Deletion' {
-                $deletionDateText = ''
-                if ($acct.UnlicensedDate) {
-                    try {
-                        $parsedUnlicensedDate = [datetime]::Parse($acct.UnlicensedDate)
-                        $computedDeletionDate = $parsedUnlicensedDate.AddDays($script:ArchiveDeletionThresholdDays).Date
-                        if ($computedDeletionDate -lt $script:DeletionEnforcementStartDate.Date) {
-                            $computedDeletionDate = $script:DeletionEnforcementStartDate.Date
-                        }
-                        $deletionDateText = $computedDeletionDate.ToString('yyyy-MM-dd')
-                    }
-                    catch {}
-                }
-                $deletionDateText
-            }
+            'Deletion' { $acct.DeletionDate }
         }
         $storageText = if ($acct.StorageUsedGB -ne '') { "$($acct.StorageUsedGB) GB" } else { 'N/A' }
 
@@ -2158,11 +2330,24 @@ if ($allCandidates.Count -eq 0 -and -not $GetCurrentlyArchived) {
 
 $archivedSites = [System.Collections.Generic.List[object]]::new()
 if ($GetCurrentlyArchived) {
-    Write-Host "`nPhase 2b: Downloading archived OneDrive accounts from SharePoint Admin API..." -ForegroundColor Cyan
-    $rawArchivedSites = Get-ArchivedOneDriveSitesFromSPOExport
+    $rawArchivedSites = switch ($ArchivedCollectionMode) {
+        'SPODownload' {
+            Write-Host "`nPhase 2b: Downloading archived OneDrive accounts from SharePoint Admin API..." -ForegroundColor Cyan
+            @(Get-ArchivedOneDriveSitesFromSPOExport)
+            break
+        }
+        'GraphSites' {
+            Write-Host "`nPhase 2b: Discovering archived OneDrive accounts through Microsoft Graph..." -ForegroundColor Cyan
+            @(Get-ArchivedOneDriveSites)
+            break
+        }
+        default {
+            throw "Unsupported ArchivedCollectionMode '$ArchivedCollectionMode'. Use 'SPODownload' or 'GraphSites'."
+        }
+    }
 
     if ($rawArchivedSites.Count -eq 0) {
-        Write-Host '  Phase 2b: SPO export returned no archived rows.' -ForegroundColor Gray
+        Write-Host "  Phase 2b: $ArchivedCollectionMode returned no archived rows." -ForegroundColor Gray
     }
 
     # Deduplicate: if a UPN from the Sites API already exists in $allCandidates (e.g., a user
@@ -2238,6 +2423,7 @@ for ($batchStart = 0; $batchStart -lt $total; $batchStart += $batchSize) {
 
     Test-ValidToken
     $headers = @{ Authorization = "Bearer $global:token" }
+    $retryableBatchResponses = [System.Collections.Generic.List[object]]::new()
 
     try {
         $batchResp = Invoke-GraphRequestWithThrottleHandling `
@@ -2277,10 +2463,15 @@ for ($batchStart = 0; $batchStart -lt $total; $batchStart += $batchSize) {
                     $driveNotFound++
                     # Never provisioned or already purged; skip.
                 }
+                { [int]$_ -in @(429, 502, 503, 504) } {
+                    $retryableBatchResponses.Add([PSCustomObject]@{
+                            User     = $user
+                            Response = $resp
+                        })
+                }
                 default {
                     $note = switch ($resp.status) {
                         403 { 'Access denied (403) — check Files.Read.All permission' }
-                        429 { 'Throttled in batch (429) — re-run or increase $delayBetweenRequests' }
                         default { "HTTP $($resp.status)" }
                     }
                     if ($debug) { Write-Host "    [--] $($user.UserPrincipalName) : $note" -ForegroundColor DarkYellow }
@@ -2297,6 +2488,31 @@ for ($batchStart = 0; $batchStart -lt $total; $batchStart += $batchSize) {
                     # 403/timeouts — included in report for admin review.
                     $confirmedUnlicensed.Add($user)
                 }
+            }
+        }
+
+        foreach ($retryItem in $retryableBatchResponses) {
+            $waitSec = $InitialBackoffSec
+            $retryAfter = $retryItem.Response.headers.'Retry-After'
+            $parsedRetryAfter = 0
+            if ($retryAfter -and [int]::TryParse([string]$retryAfter, [ref]$parsedRetryAfter) -and $parsedRetryAfter -gt 0) {
+                $waitSec = $parsedRetryAfter
+            }
+
+            Write-Host "  Batch item returned HTTP $($retryItem.Response.status). Retrying $($retryItem.User.UserPrincipalName) after ${waitSec}s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $waitSec
+            $driveInfo = Get-UserDriveInfo -UserId $retryItem.User.UserId -UserPrincipalName $retryItem.User.UserPrincipalName
+            $retryItem.User.DriveInfo = $driveInfo
+            if ($driveInfo.Found) {
+                $driveFound++
+                $confirmedUnlicensed.Add($retryItem.User)
+            }
+            elseif ($driveInfo.Note -match '404') {
+                $driveNotFound++
+            }
+            else {
+                $driveErrors++
+                $confirmedUnlicensed.Add($retryItem.User)
             }
         }
     }
@@ -2359,7 +2575,7 @@ if ($IncludeDownloadedRowsInMainReport -and $global:spoDownloadedReportRows.Coun
 
         if (-not $match -and $dl.DriveInfo -and $dl.DriveInfo.DriveWebUrl) {
             $match = $confirmedUnlicensed | Where-Object {
-                $_.DriveInfo -and $_.DriveInfo.DriveWebUrl -and $_.DriveInfo.DriveWebUrl.Equals($dl.DriveInfo.DriveWebUrl, [System.StringComparison]::OrdinalIgnoreCase)
+                $_.DriveInfo -and $_.DriveInfo.DriveWebUrl -and $_.DriveInfo.DriveWebUrl.TrimEnd('/').Equals($dl.DriveInfo.DriveWebUrl.TrimEnd('/'), [System.StringComparison]::OrdinalIgnoreCase)
             } | Select-Object -First 1
         }
 
@@ -2381,6 +2597,18 @@ if ($IncludeDownloadedRowsInMainReport -and $global:spoDownloadedReportRows.Coun
                     $changed = $true
                 }
             }
+            if ($dl.PSObject.Properties['LockState'] -and $dl.LockState) {
+                if ($match.PSObject.Properties['LockState']) {
+                    if (-not $match.LockState) {
+                        $match.LockState = $dl.LockState
+                        $changed = $true
+                    }
+                }
+                else {
+                    $match | Add-Member -NotePropertyName 'LockState' -NotePropertyValue $dl.LockState -Force
+                    $changed = $true
+                }
+            }
             if ($dl.UserSource -and $match.UserSource -ne $dl.UserSource) {
                 $match.UserSource = $dl.UserSource
                 $changed = $true
@@ -2398,6 +2626,18 @@ if ($IncludeDownloadedRowsInMainReport -and $global:spoDownloadedReportRows.Coun
                 }
                 else {
                     $match | Add-Member -NotePropertyName 'DeletionBlockedBy' -NotePropertyValue $dl.DeletionBlockedBy -Force
+                    $changed = $true
+                }
+            }
+            if ($dl.PSObject.Properties['DeletionScheduledOn'] -and $dl.DeletionScheduledOn) {
+                if ($match.PSObject.Properties['DeletionScheduledOn']) {
+                    if (-not $match.DeletionScheduledOn) {
+                        $match.DeletionScheduledOn = $dl.DeletionScheduledOn
+                        $changed = $true
+                    }
+                }
+                else {
+                    $match | Add-Member -NotePropertyName 'DeletionScheduledOn' -NotePropertyValue $dl.DeletionScheduledOn -Force
                     $changed = $true
                 }
             }
@@ -2428,6 +2668,33 @@ $global:tenantPayGStatus = Get-TenantPayGStatus
 Write-Host "  PAYG status: $($global:tenantPayGStatus.Message)" -ForegroundColor Gray
 if ($global:tenantPayGStatus -and $global:tenantPayGStatus.DetectionMode) {
     Write-Host "  PAYG detection mode: $($global:tenantPayGStatus.DetectionMode)" -ForegroundColor Gray
+}
+
+# Step 6c (Phase 4b): Look up each site's LockState (Unlock/ReadOnly/NoAccess) via SPO REST.
+if ($IncludeLockState -and $confirmedUnlicensed.Count -gt 0) {
+    Write-Host "`nPhase 4b: Querying SharePoint LockState for discovered sites..." -ForegroundColor Cyan
+    $siteUrls = @($confirmedUnlicensed | ForEach-Object { if ($_.DriveInfo -and $_.DriveInfo.DriveWebUrl) { "$($_.DriveInfo.DriveWebUrl)" } } | Where-Object { $_ })
+    $siteLockStates = Get-SiteLockStatesViaSPORest -SiteUrls $siteUrls
+
+    if ($siteLockStates.Count -gt 0) {
+        $lockStateMatched = 0
+        foreach ($acct in $confirmedUnlicensed) {
+            $siteUrl = if ($acct.DriveInfo -and $acct.DriveInfo.DriveWebUrl) { "$($acct.DriveInfo.DriveWebUrl)" } else { '' }
+            if (-not $siteUrl) { continue }
+
+            $key = $siteUrl.TrimEnd('/').ToLowerInvariant()
+            if ($siteLockStates.ContainsKey($key)) {
+                $lockStateMatched++
+                if ($acct.PSObject.Properties['LockState']) {
+                    $acct.LockState = $siteLockStates[$key]
+                }
+                else {
+                    $acct | Add-Member -NotePropertyName 'LockState' -NotePropertyValue $siteLockStates[$key] -Force
+                }
+            }
+        }
+        Write-Host "  LockState matched: $lockStateMatched of $($confirmedUnlicensed.Count) accounts." -ForegroundColor Green
+    }
 }
 
 # Step 7 (Phase 5): Enrich with milestone and post-archive risk dates.
