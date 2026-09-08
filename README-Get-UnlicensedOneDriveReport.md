@@ -1,8 +1,8 @@
 # Get-UnlicensedOneDriveReport.ps1
 
-PowerShell script to identify and report unlicensed OneDrive accounts across a Microsoft 365 tenant (including multi-geo), with archive-risk, cost, and notification workflows.
+PowerShell script to identify and report unlicensed OneDrive accounts across a Microsoft 365 tenant (including multi-geo), with archive-risk, site lock-state, cost, and notification workflows.
 
-The script uses Microsoft Graph app permissions and SharePoint Admin ExportToCSV download to enrich archived account state.
+The script uses Microsoft Graph app permissions, SharePoint Admin ExportToCSV download, and SharePoint Admin REST to enrich archived account and site lock state.
 
 ## Summary
 
@@ -61,6 +61,7 @@ When SharePoint downloaded report data is available, its archive state is treate
 - Optional audit-log enrichment for active-user unlicensed dates.
 - SharePoint Admin ExportToCSV ingestion and backfill into final dataset.
 - Archive-state reconciliation using downloaded report fields.
+- Optional SharePoint REST lookup of each discovered site's `LockState` (`Unlock`, `ReadOnly`, `NoAccess`, or `NoAdditions`).
 - Cost projection:
   - monthly storage (`$0.05/GB/month`)
   - reactivation (`$0.60/GB` one-time)
@@ -89,7 +90,7 @@ Graph application permissions:
 
 SharePoint application permission:
 
-- `Sites.FullControl.All` (required for ExportToCSV download path)
+- `Sites.FullControl.All` (required for ExportToCSV download and site `LockState` lookup)
 
 ## Important Configuration
 
@@ -114,6 +115,7 @@ Update in script `CONFIGURATION SECTION`:
   - `$SPOAdminUrls`
   - `$includeLicenseRemovalDates`
   - `$IncludeDownloadedRowsInMainReport`
+  - `$IncludeLockState`
 - Notifications
   - `$SendEmailNotifications`
   - `$EmailFrom`
@@ -148,6 +150,7 @@ Core columns include:
 - `ReadOnlyDate`
 - `ArchiveDate`
 - `ArchiveStatus`
+- `LockState`
 - `UndiscoverableDate`
 - `RearchiveDate`
 - `DaysUntilReadOnly`
@@ -184,9 +187,10 @@ Output file:
 5. Optionally enrich active users from audit logs.
 6. Resolve drive metadata.
 7. Backfill/merge downloaded report rows into final candidate list.
-8. Calculate milestones, risks, archive-status reconciliation, and costs.
-9. Export final CSV.
-10. Optionally send milestone/risk alert emails.
+8. Optionally query site `LockState` through SharePoint Admin REST.
+9. Calculate milestones, risks, archive-status reconciliation, and costs.
+10. Export final CSV and remove intermediate SPO download files.
+11. Optionally send milestone/risk alert emails.
 
 ## Troubleshooting
 
@@ -194,6 +198,12 @@ Output file:
 
 - Check downloaded SPO report `ARCHIVE_STATUS` values.
 - If report says non-archived but day math is past 93, account is intentionally flagged as `Reactivated`.
+
+### LockState is blank
+
+- Confirm `$IncludeLockState = $true` and that `$SPOAdminUrls` includes the applicable geo admin URL.
+- Confirm the app has SharePoint `Sites.FullControl.All` application permission with admin consent.
+- `ArchiveStatus` describes the unlicensed OneDrive archive lifecycle; `LockState` is the site's current SharePoint access state and may be `Unlock`, `ReadOnly`, `NoAccess`, or `NoAdditions`.
 
 ### Deletion risk appears later than day 365
 
