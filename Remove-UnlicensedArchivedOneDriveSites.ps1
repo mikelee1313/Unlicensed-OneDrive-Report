@@ -18,6 +18,9 @@
 
     For multi-geo tenants, add one entry per satellite geo to $SPOAdminUrls.
     Each geo requires its own SPO-scoped token (separate OAuth audience).
+    Vanity admin domains require an explicit $SPOAdminUrlMappings entry defining
+    the OneDrive hostnames. TokenResourceUrl can override the OAuth resource origin
+    when the registered SharePoint resource differs from the admin endpoint.
 
     When $OneDriveSiteList is populated, process only those URLs instead of reading a CSV.
     The administrator is responsible for selecting eligible sites in this mode: report-based
@@ -47,6 +50,8 @@
     $CertStore              Certificate store: 'LocalMachine' or 'CurrentUser'.
     $clientSecret           Client secret value (ClientSecret auth only).
     $SPOAdminUrls           Array of SharePoint Admin URLs, one per geo location.
+    $SPOAdminUrlMappings    Optional admin-to-OneDrive-host mappings for vanity domains,
+                           with an optional TokenResourceUrl authentication override.
     $OneDriveSiteList       Optional array of OneDrive URLs; overrides -CsvPath and CSV discovery.
     $OutputFolder           Local path to review downloaded CSV files. Defaults to $env:TEMP.
     $PerformDeletes         Default is $false (dry run). Set to $true to actually delete sites.
@@ -122,12 +127,23 @@ $clientSecret = ''
 
 #region Site Scope and Report Settings
 # ---- SharePoint Admin URLs (multi-geo: add one entry per geo location) ----
-# Format: https://<tenant>-admin.sharepoint.com  (no trailing slashes)
+# Standard format: https://<tenant>-admin.sharepoint.com; vanity URLs require a mapping.
 $SPOAdminUrls = @(
     'https://m365cpi13246019-admin.sharepoint.com'
     # 'https://contoso-EUR-admin.sharepoint.com'
     # 'https://contoso-APC-admin.sharepoint.com'
 )
+
+# ---- Vanity domain routing (optional; standard domains work without a mapping) ----
+# Keys must match configured admin URLs. OneDriveHosts contains hostnames, not URLs.
+# TokenResourceUrl is optional: use the actual registered SharePoint OAuth resource origin.
+# This changes token acquisition only; PnP and report requests still use the admin URL.
+$SPOAdminUrlMappings = @{
+    # 'https://o365spo-admin.aexp.com' = @{
+    #     OneDriveHosts = @('personal.example.com', 'contoso-my.sharepoint.com')
+    #     TokenResourceUrl = 'https://contoso-admin.sharepoint.com'
+    # }
+}
 
 # ---- Report output ----
 $OutputFolder = $env:TEMP
@@ -244,17 +260,73 @@ function Get-OAuthClientCredentialToken {
 #endregion OAuth Token Acquisition
 
 #region SharePoint Token Cache and Refresh
+function ConvertTo-SPOOrigin {
+    param([Parameter(Mandatory)] [string] $Url)
+
+    $uri = $null
+    if (-not [uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -ne 'https' -or -not $uri.IsDefaultPort -or
+        $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $uri.AbsolutePath -ne '/') {
+        throw "Invalid SharePoint origin '$Url'. Supply an HTTPS host URL without a path, query, credentials, or custom port."
+    }
+    return $uri.GetLeftPart([UriPartial]::Authority).ToLowerInvariant()
+}
+
+function Get-SPOAdminSettings {
+    param([Parameter(Mandatory)] [string] $AdminUrl)
+
+    $origin = ConvertTo-SPOOrigin -Url $AdminUrl
+    $matchingKeys = @($SPOAdminUrlMappings.Keys | Where-Object {
+        (ConvertTo-SPOOrigin -Url ([string]$_)) -eq $origin
+    })
+    if ($matchingKeys.Count -gt 1) {
+        throw "Multiple SPOAdminUrlMappings entries match '$AdminUrl'."
+    }
+    $resource = $origin
+    if ($matchingKeys.Count -eq 1) {
+        $mapping = $SPOAdminUrlMappings[$matchingKeys[0]]
+        if ($mapping -isnot [System.Collections.IDictionary]) {
+            throw "Mapping for '$AdminUrl' must contain OneDriveHosts and an optional TokenResourceUrl."
+        }
+        $hosts = @($mapping.OneDriveHosts)
+        if ($hosts.Count -eq 0) { throw "Mapping for '$AdminUrl' requires at least one OneDriveHosts hostname." }
+        $hosts = @(foreach ($hostname in $hosts) {
+            if ($hostname -isnot [string] -or [string]::IsNullOrWhiteSpace($hostname) -or
+                [uri]::CheckHostName($hostname) -ne [UriHostNameType]::Dns -or
+                $hostname.Contains('*') -or $hostname.EndsWith('.')) {
+                throw "Invalid OneDriveHosts entry for '$AdminUrl': '$hostname'. Use a DNS hostname without a scheme, path, or wildcard."
+            }
+            $hostname.ToLowerInvariant()
+        })
+        if ($mapping.Contains('TokenResourceUrl')) {
+            if ([string]::IsNullOrWhiteSpace([string]$mapping.TokenResourceUrl)) {
+                throw "TokenResourceUrl for '$AdminUrl' cannot be empty when specified."
+            }
+            $resource = ConvertTo-SPOOrigin -Url ([string]$mapping.TokenResourceUrl)
+        }
+    }
+    else {
+        $adminHost = ([uri]$origin).Host
+        if ($adminHost -notmatch '-admin\.sharepoint\.(com|us|de|cn)$') {
+            throw "Admin URL '$AdminUrl' requires a SPOAdminUrlMappings entry for its OneDrive hostnames."
+        }
+        $hosts = @($adminHost -replace '-admin\.', '-my.')
+    }
+    return [PSCustomObject]@{ OneDriveHosts = $hosts; TokenResourceUrl = $resource }
+}
+
 function AcquireSPOToken {
     <#
     .SYNOPSIS
-        Acquires a SharePoint Online admin token (scope: <SPOAdminUrl>/.default).
+        Acquires a SharePoint token using the configured resource origin plus /.default.
         Used by PnP.PowerShell and the report download function.
     #>
     param([Parameter(Mandatory)] [string] $AdminUrl)
     $cacheKey = $AdminUrl.TrimEnd('/').ToLowerInvariant()
     Write-Host "Authenticating to SharePoint Online Admin ($AuthType)..." -ForegroundColor Cyan
     try {
-        $result = Get-OAuthClientCredentialToken -Scope "$AdminUrl/.default" -DisplayName 'SPO Admin'
+        $settings = Get-SPOAdminSettings -AdminUrl $AdminUrl
+        $result = Get-OAuthClientCredentialToken -Scope "$($settings.TokenResourceUrl)/.default" -DisplayName 'SPO Admin'
         $global:spoToken = $result.access_token
         $global:spoTokenExpiry = $result.expiry
         $script:spoTokenCache[$cacheKey] = @{ Token = $result.access_token; Expiry = $result.expiry }
@@ -520,7 +592,8 @@ function Get-OneDriveAdminUrl {
         throw "Invalid OneDrive site URL: '$SiteUrl'. Supply an HTTPS /personal/<site> URL."
     }
     $matchingAdmins = @($AdminUrls | Where-Object {
-        ([uri]$_).Host -replace '-admin\.', '-my.' -eq $siteUri.Host
+        $settings = Get-SPOAdminSettings -AdminUrl $_
+        $siteUri.Host -in $settings.OneDriveHosts
     } | Select-Object -Unique)
     if ($matchingAdmins.Count -ne 1) {
         throw "OneDrive URL '$SiteUrl' must match exactly one configured SPOAdminUrls host."
@@ -933,6 +1006,18 @@ function Get-UnlicensedOneDriveReport {
 #region Main Execution
 
 #region Startup and Execution Mode
+if ($SPOAdminUrlMappings -isnot [System.Collections.IDictionary]) {
+    throw 'SPOAdminUrlMappings must be a hashtable keyed by configured admin URLs.'
+}
+$configuredOrigins = @($SPOAdminUrls | ForEach-Object { ConvertTo-SPOOrigin -Url $_ })
+foreach ($key in $SPOAdminUrlMappings.Keys) {
+    if ((ConvertTo-SPOOrigin -Url ([string]$key)) -notin $configuredOrigins) {
+        throw "SPOAdminUrlMappings key '$key' is not present in SPOAdminUrls."
+    }
+}
+foreach ($adminUrl in $SPOAdminUrls) {
+    Get-SPOAdminSettings -AdminUrl $adminUrl | Out-Null
+}
 Write-Host '===  Remove Unlicensed Archived OneDrive Sites  ===' -ForegroundColor Magenta
 Write-Host "  Processing $($SPOAdminUrls.Count) admin URL(s)..." -ForegroundColor Cyan
 
