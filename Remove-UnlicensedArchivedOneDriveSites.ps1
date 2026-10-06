@@ -79,7 +79,7 @@
     check its current SharePoint state before retrying.
 
     Created by: Mike Lee
-Date: 9/8/26
+Date: 10/6/26
 
 .EXAMPLE
     # Safe dry run: list what would be deleted, but do not delete anything.
