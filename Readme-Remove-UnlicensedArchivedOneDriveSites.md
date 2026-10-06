@@ -24,6 +24,7 @@ Site lookup, unlocking, and deletion use **PnP.PowerShell**. The existing report
 - [CSV format and eligibility](#csv-format-and-eligibility)
 - [Processing workflow](#processing-workflow)
 - [Multi-geo tenants](#multi-geo-tenants)
+- [Vanity domains](#vanity-domains)
 - [Audit journal](#audit-journal)
 - [Errors and automation](#errors-and-automation)
 - [Report download helper](#report-download-helper)
@@ -188,6 +189,7 @@ Except for `-CsvPath`, settings are edited inline in the script.
 | `$CertStore` | `'LocalMachine'` | Use `LocalMachine` or `CurrentUser`. |
 | `$clientSecret` | `''` | Retained secret-authentication setting; never publish a real secret. |
 | `$SPOAdminUrls` | Tenant-specific array | One SharePoint admin URL per geo, without a trailing slash. |
+| `$SPOAdminUrlMappings` | `@{}` | Explicit admin-to-OneDrive-host mapping for vanity domains; optional `TokenResourceUrl` overrides the OAuth resource origin. |
 | `$OutputFolder` | `$env:TEMP` | Automatic report discovery and audit output location. A dedicated folder is recommended. |
 | `$OneDriveSiteList` | `@()` | Nonempty array overrides both `-CsvPath` and automatic discovery. |
 | `$PerformDeletes` | `$false` | `$false`: dry run. `$true`: permit unlock/delete calls without another switch. |
@@ -311,9 +313,62 @@ $SPOAdminUrls = @(
 
 These are illustrative URLs; use your tenant's real geo hostnames.
 
-Routing derives the personal-site host by replacing `-admin.` with `-my.`. Each target must have exactly one matching admin entry. The same app registration is used, with tokens and connections cached per admin URL.
+For standard SharePoint admin domains, routing derives the personal-site host by replacing `-admin.` with `-my.`. An explicit mapping overrides that derived host list. Each target must have exactly one matching admin entry. The same app registration is used, with tokens and connections cached per admin URL.
 
 A selected CSV can include targets across configured geos. Automatic discovery still selects only one report; it does not merge separate geo exports. Run separate explicitly selected reports when necessary.
+
+## Vanity domains
+
+An administrator-facing vanity hostname need not follow the standard SharePoint naming pattern. Do not infer the OneDrive hostname from it. Configure the actual admin endpoint in `$SPOAdminUrls`, then map its exact OneDrive hostnames in `$SPOAdminUrlMappings`.
+
+Generic example:
+
+```powershell
+$SPOAdminUrls = @(
+    'https://portal-admin.example.com'
+)
+
+$SPOAdminUrlMappings = @{
+    'https://portal-admin.example.com' = @{
+        OneDriveHosts = @(
+            'personal.example.com'
+            'contoso-my.sharepoint.com'
+        )
+        TokenResourceUrl = 'https://contoso-admin.sharepoint.com'
+    }
+}
+
+$OneDriveSiteList = @(
+    'https://personal.example.com/personal/alex_contoso_com'
+)
+$PerformDeletes = $false
+```
+
+Replace **all** example values with verified tenant values:
+
+- Mapping keys must correspond to `$SPOAdminUrls` entries. HTTPS origins are normalized for case and trailing slash.
+- `OneDriveHosts` contains exact DNS hostnames, **not URLs**, paths, or wildcard patterns. Configure only hostnames belonging to the intended tenant/geo.
+- A mapping replaces the automatically derived host list for that admin URL. Include the standard OneDrive hostname too if targets can use both names.
+- A target must match exactly one configured admin URL. Overlapping host mappings fail closed when a target is routed.
+- Nonstandard admin domains require a mapping. Standard `-admin.sharepoint.com`, `.us`, `.de`, and `.cn` domains retain automatic routing when no mapping is supplied.
+- Both CSV mode and explicit-list mode use the same mapping and retain the HTTPS personal-site-root validation.
+
+### OAuth resource versus admin endpoint
+
+`TokenResourceUrl` is optional. When omitted, the script requests `<admin-origin>/.default`, preserving its previous authentication behavior.
+
+When the vanity endpoint is not the SharePoint resource registered with Microsoft Entra, set `TokenResourceUrl` to the **verified SharePoint OAuth resource origin** for that tenant/geo. Do not assume a DNS alias or browser redirect is a registered OAuth resource. Supply an HTTPS origin without a path, query string, custom port, or `/.default` suffix.
+
+The override changes token acquisition only:
+
+- `Connect-PnPOnline` and report requests still use the configured admin endpoint.
+- The same tenant ID, app registration, and certificate are used.
+- Tokens/connections remain cached by admin endpoint.
+- The report download function's body is unchanged; its existing shared token helper uses this resource setting.
+
+Routing support does not provision a custom domain, configure DNS/proxies, rewrite site identities, or prove that a vanity endpoint accepts PnP/CSOM requests. A browser-only vanity redirect may not work for those operations. Verify the endpoint and token audience with the tenant administrator and perform a read-only dry run before enabling deletion. If the vanity endpoint is not API-capable, use the tenant's actual API-capable SharePoint admin URL and map the accepted site hostnames to it.
+
+These configuration paths have offline mocked coverage; live vanity-domain authentication and operations have not been validated against a customer tenant.
 
 ## Audit journal
 
@@ -450,6 +505,9 @@ The script is not a function-only module. Dot-sourcing it also executes its main
 | CSV candidate is skipped | Review archive status, unlicensed reason, and blocker allowlists. Unknown values are deliberately not treated as eligible. |
 | Conflicting duplicate CSV rows | Obtain a fresh report or resolve the conflicting eligibility data. The script will not select an unblocked row over a blocked one. |
 | URL does not match an admin host | Use the personal-site root and add the correct geo admin URL. Check for duplicate/misconfigured admin entries. |
+| Vanity admin URL requires a mapping | Add its exact OneDrive hostnames to `$SPOAdminUrlMappings`. Do not assume a `-admin` to `-my` hostname replacement applies to a custom domain. |
+| Token acquisition reports an unknown resource | Verify `TokenResourceUrl` with the tenant administrator. The configured vanity URL may not be a registered SharePoint OAuth resource. |
+| Vanity endpoint works in a browser but fails in PnP | Verify that it supports authenticated SharePoint API/CSOM access, not just interactive redirects. Use the API-capable admin endpoint if necessary. |
 | Audit write failed | Stop retrying deletions until disk space and access are fixed. Preserve the partial journal and reconcile live state for unfinished checkpoints. |
 | Audit has more rows than the summary | Expected: mutation checkpoints and final results share the append-only journal. Use the last row per site. |
 | A retry fails because the site no longer exists | Check Deleted Sites and the previous audit. The script does not automatically reconcile already-deleted targets. |
@@ -492,7 +550,7 @@ A read-only PnP integration check was also performed. These checks do not certif
 
 Before uploading [the script](./Remove-UnlicensedArchivedOneDriveSites.ps1) and this README to GitHub:
 
-- Replace environment-specific tenant IDs, application IDs, admin URLs, certificate thumbprints, and sample personal-site URLs with placeholders.
+- Replace environment-specific tenant IDs, application IDs, admin URLs, vanity-domain mappings, token resource URLs, certificate thumbprints, and sample personal-site URLs with placeholders.
 - Ensure `$PerformDeletes = $false` and `$OneDriveSiteList = @()` in the published template.
 - Do not include secrets, tokens, private keys, exported certificates with private keys, authentication traces, or sensitive logs.
 - Exclude real report CSVs and audit files unless sanitized and approved for disclosure; they can expose personal-site URLs and account information.
