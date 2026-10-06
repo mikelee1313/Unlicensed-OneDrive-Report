@@ -139,7 +139,7 @@ $SPOAdminUrls = @(
 # TokenResourceUrl is optional: use the actual registered SharePoint OAuth resource origin.
 # This changes token acquisition only; PnP and report requests still use the admin URL.
 $SPOAdminUrlMappings = @{
-    # 'https://o365spo-admin.aexp.com' = @{
+    # 'https://o365spo-admin.contoso.com' = @{
     #     OneDriveHosts = @('personal.example.com', 'contoso-my.sharepoint.com')
     #     TokenResourceUrl = 'https://contoso-admin.sharepoint.com'
     # }
